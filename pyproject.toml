@@ -1,12 +1,39 @@
 [project]
-name = "mcp-remote"
+name = "mcp-hub-server-ia"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
+description = "Servidor centralizado MCP para servicios de Zoom, Evaluador de Ensayos IA y LLM"
+readme = "readme.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.12",
+    "uvicorn[standard]>=0.24.0",
+    "requests>=2.31.0",
     "mcp[cli]>=1.9.3",
     "python-dotenv>=1.1.0",
-    "tavily-python>=0.7.7",
+    "pypdf>=4.0.0",
+    "python-docx>=1.1.0",
+    "httpx>=0.25.0",
+    "stomp-py>=8.1.0",
+    "pandas>=2.0.0",
+    "openpyxl>=3.1.5",
+    "email-validator>=2.3.0",
+    "asyncpg>=0.29.0",
 ]
+
+[dependency-groups]
+# Dependencias de desarrollo (tests) — se instalan con `uv sync --group dev`.
+dev = [
+    "pytest>=8.0.0",
+]
+
+# Backend de persistencia durable del ContextStore (FASE 1 · B1.2).
+# Se instalan con `uv sync --extra db` (incluyen SQLAlchemy async).
+#   - aiosqlite: driver SQLite async (usado por defecto).
+#   - asyncpg:   driver PostgreSQL async (para conmutar a Postgres vía DB_DSN).
+[project.optional-dependencies]
+db = [
+    "sqlalchemy[asyncio]>=2.0.0",
+    "aiosqlite>=0.20.0",
+    "asyncpg>=0.29.0",
+]
+
