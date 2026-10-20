@@ -62,6 +62,8 @@ def configure_logging(
         force:    Re-aplica la configuración aunque ya esté inicializada (útil en tests).
     """
     root = logging.getLogger()
+    for noisy in ("httpx", "httpcore", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     if root.handlers and not force:
         return
 
@@ -80,10 +82,6 @@ def configure_logging(
             if str(name).startswith(log_root):
                 logging.getLogger(name).handlers.clear()
     root.addHandler(handler)
-
-    # Silenciar librerías de terceros muy ruidosas en INFO.
-    for noisy in ("httpx", "httpcore", "urllib3"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def get_logger(name: str, level: Optional[str] = None) -> logging.Logger:

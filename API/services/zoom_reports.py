@@ -3,13 +3,27 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import requests
 import os
-import base64
 import pandas as pd
 import urllib.parse
+import threading
+from functools import wraps
 from dotenv import load_dotenv
 from datetime import datetime
 from typing import List, Dict, Optional
 from openpyxl.styles import Alignment
+
+try:
+    from API.utils.zoom_api_utils import (
+        detect_session_type,
+        format_meeting_id,
+        generate_zoom_token,
+    )
+except ImportError:  # pragma: no cover
+    from utils.zoom_api_utils import (
+        detect_session_type,
+        format_meeting_id,
+        generate_zoom_token,
+    )
 
 # Cargar variables de entorno
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -18,10 +32,49 @@ load_dotenv()
 router = APIRouter()
 
 # Credenciales
-ZOOM_ACCOUNT_ID = os.getenv("ZOOM_ACCOUNT_ID")
-ZOOM_CLIENT_ID = os.getenv("ZOOM_CLIENT_ID")
-ZOOM_CLIENT_SECRET = os.getenv("ZOOM_CLIENT_SECRET")
 ZOOM_HEADER_IMAGE = os.getenv("ZOOM_HEADER_IMAGE")  # Ruta opcional del banner para encabezados
+REPORT_HTTP_TIMEOUT = 60.0
+MAX_CONCURRENT_ZOOM_REPORTS = 2
+_report_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_ZOOM_REPORTS)
+_zoom_session_local = threading.local()
+
+
+def _get_zoom_session() -> requests.Session:
+    session = getattr(_zoom_session_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=4,
+            pool_maxsize=4,
+            max_retries=0,
+        )
+        session.mount("https://", adapter)
+        _zoom_session_local.session = session
+    return session
+
+
+def _zoom_get(url: str, **kwargs):
+    kwargs.setdefault("timeout", REPORT_HTTP_TIMEOUT)
+    return _get_zoom_session().get(url, **kwargs)
+
+
+def _limited_report_concurrency(handler):
+    @wraps(handler)
+    def wrapped(*args, **kwargs):
+        if not _report_semaphore.acquire(blocking=False):
+            from fastapi import HTTPException
+
+            raise HTTPException(
+                status_code=429,
+                detail="Hay demasiados reportes de Zoom en proceso. Intente nuevamente.",
+                headers={"Retry-After": "5"},
+            )
+        try:
+            return handler(*args, **kwargs)
+        finally:
+            _report_semaphore.release()
+
+    return wrapped
 
 
 class ZoomReportRequest(BaseModel):
@@ -36,86 +89,6 @@ class RecurringSessionInfo(BaseModel):
     participants_count: int
     registrants_count: int
     status: str
-
-
-def generate_zoom_token():
-    """Genera un token válido de Zoom"""
-    credentials = f"{ZOOM_CLIENT_ID}:{ZOOM_CLIENT_SECRET}"
-    encoded_credentials = base64.b64encode(credentials.encode()).decode()
-    url = f"https://zoom.us/oauth/token?grant_type=account_credentials&account_id={ZOOM_ACCOUNT_ID}"
-    headers = {"Authorization": f"Basic {encoded_credentials}"}
-    response = requests.post(url, headers=headers)
-    if response.status_code == 200:
-        return response.json().get("access_token")
-    raise HTTPException(status_code=response.status_code, detail=response.text)
-
-
-def format_meeting_id(meeting_id: str) -> str:
-    """Formatea el meeting ID para los diferentes endpoints de Zoom"""
-    if '%' in meeting_id:
-        meeting_id = urllib.parse.unquote(meeting_id)
-    return meeting_id
-
-
-def detect_session_type(meeting_id: str, headers: dict) -> str:
-    """Detecta si el ID corresponde a una reunión (meeting) o webinar"""
-    formatted_id = format_meeting_id(meeting_id)
-    # Intentar primero como meeting
-    try:
-        url_meeting = f"https://api.zoom.us/v2/meetings/{formatted_id}"
-        response_meeting = requests.get(url_meeting, headers=headers)
-        if response_meeting.status_code == 200:
-            print(f"✅ Detectado como MEETING: {formatted_id}")
-            return "meeting"
-    except Exception as e:
-        print(f"❌ Error al verificar meeting: {e}")
-
-    # Intentar como webinar
-    try:
-        url_webinar = f"https://api.zoom.us/v2/webinars/{formatted_id}"
-        response_webinar = requests.get(url_webinar, headers=headers)
-        if response_webinar.status_code == 200:
-            print(f"✅ Detectado como WEBINAR: {formatted_id}")
-            return "webinar"
-    except Exception as e:
-        print(f"❌ Error al verificar webinar: {e}")
-
-    # Si no se puede detectar, asumir meeting por defecto
-    print(f"⚠️ No se pudo detectar el tipo de sesión, asumiendo MEETING: {formatted_id}")
-    return "meeting"
-
-
-def is_recurring_meeting(session_data: dict) -> bool:
-    """
-    Determina si una reunión es recurrente usando múltiples indicadores.
-    Más robusto que solo verificar recurrence.type.
-    """
-    recurrence = session_data.get("recurrence", {})
-
-    # 1. Tipo de recurrencia válido (1-8)
-    recurrence_type = recurrence.get("type")
-    if recurrence_type in [1, 2, 3, 4, 5, 6, 7, 8]:
-        return True
-
-    # 2. Campos que indican recurrencia aunque type sea 0 o nulo
-    if (
-        recurrence.get("repeat_interval") or
-        recurrence.get("weekly_days") or
-        recurrence.get("monthly_day") or
-        recurrence.get("monthly_week") or
-        recurrence.get("monthly_week_day")
-    ):
-        return True
-
-    # 3. Si tiene múltiples ocurrencias (aunque no esté en recurrence)
-    if session_data.get("occurrences") and len(session_data["occurrences"]) > 1:
-        return True
-
-    # 4. Si tiene end_times o end_date_time, puede ser recurrente
-    if recurrence.get("end_times") or recurrence.get("end_date_time"):
-        return True
-
-    return False
 
 
 def extract_custom_questions_columns(registrants: list) -> tuple:
@@ -185,7 +158,7 @@ def get_qa_report_with_pagination(session_uuid: str, headers: dict) -> List[Dict
             params["next_page_token"] = page_token
 
         print(f"📄 Obteniendo página de Q&A para UUID: {session_uuid}")
-        res = requests.get(base_url, headers=headers, params=params)
+        res = _zoom_get(base_url, headers=headers, params=params)
 
         if res.status_code == 200:
             data = res.json()
@@ -299,7 +272,7 @@ def get_registrants_with_pagination(meeting_id: str, session_type: str, headers:
             params["next_page_token"] = page_token
 
         print(f"📄 Obteniendo página de registrants con params: {params}")
-        res = requests.get(url, headers=headers, params=params)
+        res = _zoom_get(url, headers=headers, params=params)
 
         if res.status_code == 200:
             data = res.json()
@@ -361,7 +334,7 @@ def check_recurring_sessions(meeting_id: str, headers: dict, session_type: str) 
     base_url = "https://api.zoom.us/v2"
     url_session_info = f"{base_url}/{ 'meetings' if session_type == 'meeting' else 'webinars' }/{formatted_id}"
 
-    res_session_info = requests.get(url_session_info, headers=headers)
+    res_session_info = _zoom_get(url_session_info, headers=headers)
     if res_session_info.status_code != 200:
         print(f"❌ Error obteniendo información de sesión: {res_session_info.text}")
         return {"is_recurring": False, "sessions": []}
@@ -372,7 +345,7 @@ def check_recurring_sessions(meeting_id: str, headers: dict, session_type: str) 
     url_instances = f"{base_url}/past_{ 'meetings' if session_type == 'meeting' else 'webinars' }/{formatted_id}/instances"
     print(f"🔗 URL Instances: {url_instances}")
 
-    res_instances = requests.get(url_instances, headers=headers)
+    res_instances = _zoom_get(url_instances, headers=headers)
     print(f"📊 Status Instances: {res_instances.status_code}")
 
     if res_instances.status_code != 200:
@@ -455,7 +428,7 @@ def get_session_details(session_id: str, headers: dict, session_type: str) -> Di
     else:
         url_session = f"https://api.zoom.us/v2/past_webinars/{encoded_id}"
 
-    res_session = requests.get(url_session, headers=headers)
+    res_session = _zoom_get(url_session, headers=headers)
     if res_session.status_code != 200:
         print(f"❌ Error obteniendo detalles de sesión: {res_session.text}")
         return {}
@@ -464,7 +437,8 @@ def get_session_details(session_id: str, headers: dict, session_type: str) -> Di
 
 
 @router.post("/zoom/report/check")
-async def check_zoom_report(request: ZoomReportRequest):
+@_limited_report_concurrency
+def check_zoom_report(request: ZoomReportRequest):
     """Verifica si existen inscritos para la reunión y devuelve estadísticas."""
     import requests
     import urllib.parse
@@ -497,7 +471,7 @@ async def check_zoom_report(request: ZoomReportRequest):
     # Nota: Este bloque de info de sesión es duplicado/simplificado para el chequeo
     entity = 'meetings' if session_type == 'meeting' else 'webinars'
     url_session_info = f"https://api.zoom.us/v2/{entity}/{formatted_meeting_id}"
-    res_session_info = requests.get(url_session_info, headers=headers)
+    res_session_info = _zoom_get(url_session_info, headers=headers)
     session_data = res_session_info.json() if res_session_info.status_code == 200 else {}
     
     # ----------------------------------------------------------------------
@@ -553,7 +527,7 @@ async def check_zoom_report(request: ZoomReportRequest):
     # 2. Obtener UUID para participantes y Q&A
     entity_past = 'past_meetings' if session_type == 'meeting' else 'past_webinars'
     url_past_info = f"https://api.zoom.us/v2/{entity_past}/{formatted_meeting_id}"
-    res_past_info = requests.get(url_past_info, headers=headers)
+    res_past_info = _zoom_get(url_past_info, headers=headers)
     
     if res_past_info.status_code != 200:
         raise HTTPException(status_code=res_past_info.status_code, detail=f"Error obteniendo UUID/Info de sesión pasada: {res_past_info.text}")
@@ -578,7 +552,7 @@ async def check_zoom_report(request: ZoomReportRequest):
     # Usaremos una aproximación simple para no recrear toda la función de paginación:
     try:
         # *Reemplaza esta sección con tu paginación de participantes real*
-        res_participants = requests.get(url_participants, headers=headers, params={"page_size": 1})
+        res_participants = _zoom_get(url_participants, headers=headers, params={"page_size": 1})
         total_unique_participants = res_participants.json().get('total_records', 'N/A')
     except Exception:
         total_unique_participants = 'N/A'
@@ -599,7 +573,7 @@ async def check_zoom_report(request: ZoomReportRequest):
 # ha sido ELIMINADO de este endpoint, dejando esa responsabilidad
 # únicamente en el endpoint router.post("/zoom/report/excel").
 
-async def generate_recurring_session_excel(meeting_id: str, session_type: str, recurring_info: dict, headers: dict):
+def generate_recurring_session_excel(meeting_id: str, session_type: str, recurring_info: dict, headers: dict):
     """Genera Excel para una sesión recurrente con múltiples hojas, incluyendo Q&A para Webinars."""
     formatted_meeting_id = format_meeting_id(meeting_id)
     
@@ -611,7 +585,7 @@ async def generate_recurring_session_excel(meeting_id: str, session_type: str, r
     else:  # webinar
         url_session_info = f"https://api.zoom.us/v2/webinars/{formatted_meeting_id}"
     
-    res_session_info = requests.get(url_session_info, headers=headers)
+    res_session_info = _zoom_get(url_session_info, headers=headers)
     session_data = res_session_info.json() if res_session_info.status_code == 200 else {}
 
     print(f"🟢 Respuesta completa de la sesión: {session_data}")
@@ -870,7 +844,7 @@ def get_session_data(session_id: str, session_type: str, headers: dict) -> tuple
     else:
         url_participants = f"https://api.zoom.us/v2/report/webinars/{session_id}/participants"
     
-    res_participants = requests.get(url_participants, headers=headers)
+    res_participants = _zoom_get(url_participants, headers=headers)
     if res_participants.status_code == 200:
         participants = res_participants.json().get("participants", [])
     
@@ -1227,7 +1201,7 @@ def get_polls_for_meeting(meeting_id, session_type, headers, is_recurrent=False,
         if is_recurrent and instance_uuids:
             for uuid in instance_uuids:
                 url = f"https://api.zoom.us/v2/report/meetings/{uuid}/polls"
-                res = requests.get(url, headers=headers)
+                res = _zoom_get(url, headers=headers)
                 if res.status_code == 200:
                     polls = res.json().get("polls", [])
                     for poll in polls:
@@ -1235,7 +1209,7 @@ def get_polls_for_meeting(meeting_id, session_type, headers, is_recurrent=False,
                         polls_data.append(poll)
         else:
             url = f"https://api.zoom.us/v2/report/meetings/{meeting_id}/polls"
-            res = requests.get(url, headers=headers)
+            res = _zoom_get(url, headers=headers)
             if res.status_code == 200:
                 polls = res.json().get("polls", [])
                 polls_data.extend(polls)
@@ -1243,7 +1217,7 @@ def get_polls_for_meeting(meeting_id, session_type, headers, is_recurrent=False,
         if is_recurrent and instance_uuids:
             for uuid in instance_uuids:
                 url = f"https://api.zoom.us/v2/report/webinars/{uuid}/polls"
-                res = requests.get(url, headers=headers)
+                res = _zoom_get(url, headers=headers)
                 if res.status_code == 200:
                     polls = res.json().get("polls", [])
                     for poll in polls:
@@ -1251,7 +1225,7 @@ def get_polls_for_meeting(meeting_id, session_type, headers, is_recurrent=False,
                         polls_data.append(poll)
         else:
             url = f"https://api.zoom.us/v2/report/webinars/{meeting_id}/polls"
-            res = requests.get(url, headers=headers)
+            res = _zoom_get(url, headers=headers)
             if res.status_code == 200:
                 polls = res.json().get("polls", [])
                 polls_data.extend(polls)
@@ -1285,7 +1259,7 @@ def get_participants_with_pagination(uuid_or_id: str, session_type: str, headers
             if page_token:
                 params["next_page_token"] = page_token
 
-            res = requests.get(url, headers=headers, params=params)
+            res = _zoom_get(url, headers=headers, params=params)
             if res.status_code == 200:
                 data = res.json()
                 current = data.get("participants", [])
@@ -1305,7 +1279,7 @@ def get_participants_with_pagination(uuid_or_id: str, session_type: str, headers
     if session_type == "meeting":
         # Intentar obtener instancias (si es recurrente)
         url_instances = f"https://api.zoom.us/v2/past_meetings/{uuid_or_id}/instances"
-        res = requests.get(url_instances, headers=headers)
+        res = _zoom_get(url_instances, headers=headers)
 
         if res.status_code == 200:
             instances = res.json().get("meetings", [])
@@ -1326,7 +1300,7 @@ def get_participants_with_pagination(uuid_or_id: str, session_type: str, headers
     elif session_type == "webinar":
         # Intentar obtener instancias (si es recurrente)
         url_instances = f"https://api.zoom.us/v2/past_webinars/{uuid_or_id}/instances"
-        res = requests.get(url_instances, headers=headers)
+        res = _zoom_get(url_instances, headers=headers)
 
         if res.status_code == 200:
             instances = res.json().get("webinars", [])
@@ -1416,7 +1390,7 @@ def get_qa_for_meeting(meeting_id, session_type, headers, is_recurrent=False, in
         if is_recurrent and instance_uuids:
             for uuid in instance_uuids:
                 url = f"https://api.zoom.us/v2/report/webinars/{uuid}/qa"
-                res = requests.get(url, headers=headers)
+                res = _zoom_get(url, headers=headers)
                 if res.status_code == 200:
                     qa = res.json().get("questions", [])
                     for q in qa:
@@ -1424,7 +1398,7 @@ def get_qa_for_meeting(meeting_id, session_type, headers, is_recurrent=False, in
                         qa_data.append(q)
         else:
             url = f"https://api.zoom.us/v2/report/webinars/{meeting_id}/qa"
-            res = requests.get(url, headers=headers)
+            res = _zoom_get(url, headers=headers)
             if res.status_code == 200:
                 qa = res.json().get("questions", [])
                 qa_data.extend(qa)
@@ -1438,7 +1412,7 @@ def get_qa_for_webinar(webinar_id: str, headers: dict) -> list:
     """
     import requests
     url_qa = f"https://api.zoom.us/v2/past_webinars/{webinar_id}/qa"
-    res_qa = requests.get(url_qa, headers=headers)
+    res_qa = _zoom_get(url_qa, headers=headers)
     all_qas = []
     if res_qa.status_code == 200:
         qas = res_qa.json().get("questions", [])
@@ -1460,7 +1434,8 @@ def get_router() -> APIRouter:
     return router
 
 @router.post("/zoom/report/excel")
-async def get_zoom_report_excel(request: ZoomReportRequest):
+@_limited_report_concurrency
+def get_zoom_report_excel(request: ZoomReportRequest):
     """
     Genera el reporte Excel para una sesión simple o recurrente.
     """
@@ -1471,11 +1446,11 @@ async def get_zoom_report_excel(request: ZoomReportRequest):
     recurring_info = check_recurring_sessions(formatted_meeting_id, headers, session_type)
 
     if recurring_info.get("is_recurring"):
-        return await generate_recurring_session_excel(request.meeting_id, session_type, recurring_info, headers)
+        return generate_recurring_session_excel(request.meeting_id, session_type, recurring_info, headers)
     else:
-        return await generate_single_session_excel(request.meeting_id, session_type, headers)
+        return generate_single_session_excel(request.meeting_id, session_type, headers)
 
-async def generate_single_session_excel(meeting_id: str, session_type: str, headers: dict):
+def generate_single_session_excel(meeting_id: str, session_type: str, headers: dict):
     import pandas as pd
     import os
     from datetime import datetime
@@ -1549,7 +1524,7 @@ async def generate_single_session_excel(meeting_id: str, session_type: str, head
     all_participants = []
     if session_type == "webinar":
         url_instances = f"https://api.zoom.us/v2/past_webinars/{formatted_meeting_id}/instances"
-        res_instances = requests.get(url_instances, headers=headers)
+        res_instances = _zoom_get(url_instances, headers=headers)
         if res_instances.status_code == 200:
             instances = res_instances.json().get("webinars", [])
             if instances:
@@ -1563,7 +1538,7 @@ async def generate_single_session_excel(meeting_id: str, session_type: str, head
                             params = {"page_size": 100}
                             if page_token:
                                 params["next_page_token"] = page_token
-                            res_participants = requests.get(url_participants, headers=headers, params=params)
+                            res_participants = _zoom_get(url_participants, headers=headers, params=params)
                             if res_participants.status_code == 200:
                                 data = res_participants.json()
                                 current_participants = data.get("participants", [])
@@ -1580,7 +1555,7 @@ async def generate_single_session_excel(meeting_id: str, session_type: str, head
                     params = {"page_size": 100}
                     if page_token:
                         params["next_page_token"] = page_token
-                    res_participants = requests.get(url_participants, headers=headers, params=params)
+                    res_participants = _zoom_get(url_participants, headers=headers, params=params)
                     if res_participants.status_code == 200:
                         data = res_participants.json()
                         current_participants = data.get("participants", [])
@@ -1597,7 +1572,7 @@ async def generate_single_session_excel(meeting_id: str, session_type: str, head
                 params = {"page_size": 100}
                 if page_token:
                     params["next_page_token"] = page_token
-                res_participants = requests.get(url_participants, headers=headers, params=params)
+                res_participants = _zoom_get(url_participants, headers=headers, params=params)
                 if res_participants.status_code == 200:
                     data = res_participants.json()
                     current_participants = data.get("participants", [])
@@ -1609,7 +1584,7 @@ async def generate_single_session_excel(meeting_id: str, session_type: str, head
                     break
     else:
         url_instances = f"https://api.zoom.us/v2/past_meetings/{formatted_meeting_id}/instances"
-        res_instances = requests.get(url_instances, headers=headers)
+        res_instances = _zoom_get(url_instances, headers=headers)
         if res_instances.status_code == 200:
             instances = res_instances.json().get("meetings", [])
             if instances:
@@ -1623,7 +1598,7 @@ async def generate_single_session_excel(meeting_id: str, session_type: str, head
                             params = {"page_size": 100}
                             if page_token:
                                 params["next_page_token"] = page_token
-                            res_participants = requests.get(url_participants, headers=headers, params=params)
+                            res_participants = _zoom_get(url_participants, headers=headers, params=params)
                             if res_participants.status_code == 200:
                                 data = res_participants.json()
                                 current_participants = data.get("participants", [])
@@ -1641,7 +1616,7 @@ async def generate_single_session_excel(meeting_id: str, session_type: str, head
 
                     if page_token:
                         params["next_page_token"] = page_token
-                    res_participants = requests.get(url_participants, headers=headers, params=params)
+                    res_participants = _zoom_get(url_participants, headers=headers, params=params)
                     if res_participants.status_code == 200:
                         data = res_participants.json()
                         current_participants = data.get("participants", [])
@@ -1659,7 +1634,7 @@ async def generate_single_session_excel(meeting_id: str, session_type: str, head
                 params = {"page_size": 100}
                 if page_token:
                     params["next_page_token"] = page_token
-                res_participants = requests.get(url_participants, headers=headers, params=params)
+                res_participants = _zoom_get(url_participants, headers=headers, params=params)
                 if res_participants.status_code == 200:
                     data = res_participants.json()
                     current_participants = data.get("participants", [])
@@ -1684,7 +1659,7 @@ async def generate_single_session_excel(meeting_id: str, session_type: str, head
     if session_type == "webinar" and not session_info.get("alternative_hosts"):
         # Buscar en settings alternativos si existe
         url = f"https://api.zoom.us/v2/webinars/{meeting_id}/settings"
-        res = requests.get(url, headers=headers)
+        res = _zoom_get(url, headers=headers)
         if res.status_code == 200:
             settings = res.json()
             alt_hosts = settings.get("alternative_hosts", "")
@@ -1794,7 +1769,7 @@ def get_session_info_for_excel(meeting_id: str, session_type: str, headers: dict
         url = f"https://api.zoom.us/v2/webinars/{meeting_id}"
 
     print(f"🔗 Consultando endpoint para sesión: {url}")
-    res = requests.get(url, headers=headers)
+    res = _zoom_get(url, headers=headers)
     if res.status_code != 200:
         print(f"❌ Error obteniendo datos de sesión: {res.status_code} - {res.text}")
     session_info = res.json() if res.status_code == 200 else {}

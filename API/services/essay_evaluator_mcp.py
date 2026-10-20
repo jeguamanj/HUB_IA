@@ -1,18 +1,22 @@
 # API/services/essay_evaluator_mcp.py
 
 from API.llm_providers import openai
+import hashlib
 import os
 import json
 import re
-import logging
-from datetime import datetime
-from typing import Dict, Any, List, Optional, Union
+import time
+from datetime import datetime, timezone
+from functools import wraps
+from typing import Annotated, Dict, Any, List, Optional, Union
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict, AliasChoices, field_validator, model_validator
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from mcp.server.fastmcp import FastMCP
 import httpx
+
+from API.utils.text_cleaner import clean_text, clean_rubrica_line
 
 try:
     from API.core.logging import get_logger
@@ -20,6 +24,78 @@ except ImportError:  # pragma: no cover
     from core.logging import get_logger
 
 logger = get_logger("services.essay_evaluator_mcp")
+
+
+def _with_mcp_telemetry(tool_name: str):
+    def decorate(function):
+        @wraps(function)
+        async def wrapped(*args, **kwargs):
+            started_at = datetime.now(timezone.utc)
+            started_clock = time.perf_counter()
+            status = "SUCCESS"
+            try:
+                result = await function(*args, **kwargs)
+                if isinstance(result, dict) and result.get("status") == "error":
+                    status = "ERROR"
+                return result
+            except Exception:
+                status = "ERROR"
+                raise
+            finally:
+                try:
+                    await get_manager().backend.record_mcp_invocation(
+                        tool_name=tool_name,
+                        status=status,
+                        started_at=started_at,
+                        finished_at=datetime.now(timezone.utc),
+                        duration_ms=int((time.perf_counter() - started_clock) * 1000),
+                        error_code="TOOL_ERROR" if status == "ERROR" else None,
+                        error_message="Tool execution failed" if status == "ERROR" else None,
+                    )
+                except Exception as exc:
+                    logger.warning("No se pudo guardar telemetría MCP (%s).", type(exc).__name__)
+
+        return wrapped
+
+    return decorate
+
+
+async def _chat_with_telemetry(provider: str, chat, prompt: str, *, is_fallback=False):
+    started_at = datetime.now(timezone.utc)
+    started_clock = time.perf_counter()
+    status = "SUCCESS"
+    result = None
+    error_code = None
+    try:
+        result = await chat(prompt)
+        if isinstance(result, dict) and result.get("error"):
+            status = "ERROR"
+            error_code = "PROVIDER_ERROR"
+        return result
+    except Exception:
+        status = "ERROR"
+        error_code = "PROVIDER_ERROR"
+        raise
+    finally:
+        usage = result.get("usage", {}) if isinstance(result, dict) else {}
+        input_tokens = usage.get("prompt_tokens") or usage.get("input_tokens")
+        output_tokens = usage.get("completion_tokens") or usage.get("output_tokens")
+        try:
+            await get_manager().backend.record_llm_invocation(
+                provider=provider,
+                model=(result or {}).get("model") if isinstance(result, dict) else None,
+                is_fallback=is_fallback,
+                status=status,
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+                duration_ms=int((time.perf_counter() - started_clock) * 1000),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                token_source="provider" if input_tokens is not None or output_tokens is not None else "unknown",
+                error_code=error_code,
+            )
+        except Exception as exc:
+            logger.warning("No se pudo guardar telemetría LLM (%s).", type(exc).__name__)
 
 # Asegurar que el directorio raíz esté en sys.path para ejecuciones directas
 import sys
@@ -32,12 +108,20 @@ try:
     from API.llm_providers import deepseek, gemini, modelo, ollama
     from API.core.context_engine import (
         get_current_context,
-        set_current_context,
+        use_current_context,
+        DEFAULT_LMS_INSTITUTION_ID,
         InstitutionalContext,
-        context_store
+        context_store,
+        lms_activity_context_id,
     )
     from API.core.submission_tracker import get_tracker
-    from API.core.evaluation_queue import get_manager, STATUS_PENDING, STATUS_EVALUATED
+    from API.core.evaluation_queue import (
+        AttemptLimitExceeded,
+        get_manager,
+        STATUS_PENDING,
+        STATUS_EVALUATED,
+    )
+    from API.config import get_settings
 except ImportError:
     # pyrefly: ignore [missing-import]
     from utils.document_parser import parse_document_input  # type: ignore
@@ -46,14 +130,23 @@ except ImportError:
     # pyrefly: ignore [missing-import]
     from core.context_engine import (  # type: ignore
         get_current_context,
-        set_current_context,
+        use_current_context,
+        DEFAULT_LMS_INSTITUTION_ID,
         InstitutionalContext,
-        context_store
+        context_store,
+        lms_activity_context_id,
     )
     # pyrefly: ignore [missing-import]
     from core.submission_tracker import get_tracker  # type: ignore
     # pyrefly: ignore [missing-import]
-    from core.evaluation_queue import get_manager, STATUS_PENDING, STATUS_EVALUATED  # type: ignore
+    from core.evaluation_queue import (  # type: ignore
+        AttemptLimitExceeded,
+        get_manager,
+        STATUS_PENDING,
+        STATUS_EVALUATED,
+    )
+    # pyrefly: ignore [missing-import]
+    from config import get_settings  # type: ignore
 
 # Inicializar FastMCP Server
 mcp = FastMCP("evaluador-ensayos-mcp")
@@ -154,18 +247,22 @@ class RubricaGenerica(BaseModel):
         lineas = [f"RÚBRICA DE EVALUACIÓN: {self.titulo} (Escala Máxima: {self.calcular_escala_maxima()} pts)\n"]
         for idx, crit in enumerate(self.criterios, 1):
             ignorado = " [FORMATIVO - NO SUMA A NOTA FINAL]" if crit.ignore_for_scoring else ""
-            lineas.append(f"CRITERIO {idx}: {crit.description} (ID: {crit.id or idx} | Máximo: {crit.points} pts){ignorado}")
+            desc = clean_rubrica_line(crit.description) or f"Criterio {idx}"
+            lineas.append(f"CRITERIO {idx}: {desc} (ID: {crit.id or idx} | Máximo: {crit.points} pts){ignorado}")
             # Solo incluir long_description si aporta información distinta a description para ahorrar tokens
-            if crit.long_description and crit.long_description.strip() != crit.description.strip():
-                lineas.append(f"  Detalle: {crit.long_description.strip()}")
+            ld = clean_rubrica_line(crit.long_description)
+            if ld and ld != clean_rubrica_line(crit.description):
+                lineas.append(f"  Detalle: {ld}")
             if crit.ratings:
                 lineas.append("  Niveles de Desempeño:")
                 for r in crit.ratings:
                     detalle = ""
-                    if r.long_description and r.long_description.strip() != r.description.strip():
-                        detalle = f" - {r.long_description.strip()}"
+                    rld = clean_rubrica_line(r.long_description)
+                    if rld and rld != clean_rubrica_line(r.description):
+                        detalle = f" - {rld}"
                     id_txt = f" (ID Nivel: {r.id})" if r.id else ""
-                    lineas.append(f"    * [{r.points} pts] {r.description}{id_txt}{detalle}")
+                    rdesc = clean_rubrica_line(r.description) or f"{r.points} pts"
+                    lineas.append(f"    * [{r.points} pts] {rdesc}{id_txt}{detalle}")
             lineas.append("")
         return "\n".join(lineas)
 
@@ -306,6 +403,7 @@ class SolicitudEvaluacionDirecta(BaseModel):
         None, description="Texto directo, ruta a archivo .pdf/.docx, URL, Base64 o lista/JSON estructurado de la rúbrica (Canvas/LMS)"
     )
     id_entrega: str = Field("entrega_001", description="Identificador único de la entrega")
+    context_id: Optional[str] = Field(None, description="ID del contexto persistido asociado a una actividad LMS")
     proveedor_llm: str = Field("modelo", description="Proveedor LLM: 'modelo' (recomendado con fallback automático gratuito), 'deepseek', 'gemini', 'gemma', 'openai', 'ollama'")
     instrucciones_adicionales: str = Field("", description="Directrices pedagógicas adicionales")
     canal_entrega: str = Field("local", description="Canal: local, webhook, todos")
@@ -316,6 +414,12 @@ class SolicitudEvaluacionDirecta(BaseModel):
     # Límite de envíos por tarea-estudiante, configurable por petición (LTI).
     # Si es None, se usa el valor global (`MAX_SUBMISSION_ATTEMPTS` del .env).
     max_intentos: Optional[int] = Field(None, description="Máximo de envíos evaluables para esta tarea (sobrescribe la config global). Dejar vacío para usar MAX_SUBMISSION_ATTEMPTS")
+    context_grace_days: Optional[int] = Field(
+        None,
+        ge=0,
+        le=365,
+        description="Sobrescribe el período de gracia del contexto LMS después del cierre de la actividad.",
+    )
 
     # Bloques nativos para payloads que provienen directamente del Webhook de Canvas LMS
     assignment: Optional[Dict[str, Any]] = None
@@ -326,6 +430,7 @@ class SolicitudEvaluacionDirecta(BaseModel):
 
     # Variables LMS actualizadas y ampliadas (soporta s.*, g.* y anteriores)
     id_lms: Optional[str] = Field("CANVAS", description="Identificador del sistema LMS (ej. Canvas, Moodle, Blackboard)", validation_alias=AliasChoices("id_lms", "ID_LMS", "sistema_lms", "Id_lms"))
+    institution_id: Optional[str] = Field(None, description="Identificador de la institución propietaria del curso")
     course_id: Optional[str] = Field(None, description="Identificador del curso LMS (s.course_id)", validation_alias=AliasChoices("course_id", "s.course_id", "id_curso", "ID_CURSO", "Id_curso"))
     user_id_canvas: Optional[str] = Field(None, description="Identificador del usuario en el LMS (s.user_id_canvas)", validation_alias=AliasChoices("user_id_canvas", "s.user_id_canvas", "id_usuario", "user_id", "ID_USUARIO", "Id_usuario"))
     assignment_id: Optional[str] = Field(None, description="Identificador de la tarea/actividad (g.assignment_id)", validation_alias=AliasChoices("assignment_id", "g.assignment_id", "id_asignacion", "id_actividad", "id_tarea", "ID_ACTIVIDAD"))
@@ -409,6 +514,8 @@ class SolicitudEvaluacionDirecta(BaseModel):
                 data["assignment_id"] = lms_slot.get("assignment_id")
             if not data.get("assignment_name") and lms_slot.get("assignment_name"):
                 data["assignment_name"] = lms_slot.get("assignment_name")
+            if not data.get("assignment_description") and lms_slot.get("assignment_description"):
+                data["assignment_description"] = lms_slot.get("assignment_description")
 
         # Validaciones de presencia mínima
         if not data.get("origen_ensayo"):
@@ -450,6 +557,7 @@ class SolicitudEvaluacionDirecta(BaseModel):
 # ============================================================
 
 @mcp.tool()
+@_with_mcp_telemetry("obtener_ensayos")
 async def obtener_ensayos(
     origen_ensayo: str,
     origen_rubrica: Union[str, List[Any], Dict[str, Any]],
@@ -631,9 +739,10 @@ def _extraer_consigna_evaluable(descripcion: str) -> str:
             unidades.append(ln)
 
     consigna = " ".join(unidades).strip()
-    # Compactar espacios múltiples.
-    consigna = re.sub(r"\s+", " ", consigna)
-    return consigna[:1200]
+    # Saneo robusto: elimina caracteres de control, tabs, separadores y basura.
+    consigna = clean_text(consigna, collapse_lines=True, limit_chars=1200)
+    # Si quedó vacía tras la limpieza (todo era basura), devolver cadena vacía.
+    return consigna
 
 
 def _construir_prompt_evaluacion(
@@ -646,8 +755,14 @@ def _construir_prompt_evaluacion(
     ctx = get_current_context()
     context_block = ""
     if ctx:
-        # Modo compacto: inyecta directiva institucional de alta densidad, excluyendo metadatos de LMS y decoradores
-        context_block = f"\n{ctx.to_system_instruction(compact=True)}\n"
+        # Inyectar la directiva institucional COMPRIMIDA por presupuesto de tokens
+        # (B1.3 prompt-compiler). El presupuesto es configurable a nivel de institución
+        # vía `PROMPT_EVAL_CONTEXT_BUDGET` (default 512). El compilador garantiza que
+        # el bloque nunca exceda el tope, recortando campos críticos si es necesario.
+        cfg = get_settings()
+        budget = getattr(cfg, "prompt_eval_context_budget", 512)
+        language = getattr(cfg, "prompt_context_language", None)
+        context_block = f"\n{ctx.to_system_instruction(budget_tokens=budget, language=language)}\n"
         if not escala_maxima_sugerida and ctx.evaluation_scale:
             escala_maxima_sugerida = ctx.evaluation_scale
 
@@ -729,6 +844,7 @@ IMPORTANTE: Responde ÚNICAMENTE con un objeto JSON válido (sin explicaciones p
 
 
 @mcp.tool()
+@_with_mcp_telemetry("evaluar_con_rubrica")
 async def evaluar_con_rubrica(
     texto_ensayo: str,
     texto_rubrica: str,
@@ -779,38 +895,40 @@ async def evaluar_con_rubrica(
     raw_response_text = ""
     prov = (proveedor_llm or "modelo").strip().lower()
     if prov in ["modelo", "free", "openrouter-free"]:
-        llm_result = await modelo.chat(prompt)
+        llm_result = await _chat_with_telemetry("openrouter", modelo.chat, prompt)
         if "error" in llm_result:
             return {"status": "error", "mensaje": f"Error del LLM (Modelo Free Fallback): {llm_result['error']}"}
         raw_response_text = llm_result.get("response", "") or llm_result.get("text", "")
     elif prov in ["gemini", "gemma"]:
-        llm_result = await gemini.chat(prompt)
+        llm_result = await _chat_with_telemetry("gemini", gemini.chat, prompt)
         if "error" in llm_result:
             if "429" in str(llm_result.get("error", "")):
                 logger.warning("Evaluador Ensayos: Gemma saturado (429). Ejecutando fallback automático con modelo.py...")
-                llm_result = await modelo.chat(prompt)
+                llm_result = await _chat_with_telemetry(
+                    "openrouter", modelo.chat, prompt, is_fallback=True
+                )
                 if "error" in llm_result:
                     return {"status": "error", "mensaje": f"Error del LLM tras fallback: {llm_result['error']}"}
             else:
                 return {"status": "error", "mensaje": f"Error del LLM (Gemma): {llm_result['error']}"}
         raw_response_text = llm_result.get("response", "") or llm_result.get("text", "")
     elif prov == "deepseek":
-        llm_result = await deepseek.chat(prompt)
+        llm_result = await _chat_with_telemetry("deepseek", deepseek.chat, prompt)
         if "error" in llm_result:
             return {"status": "error", "mensaje": f"Error del LLM: {llm_result['error']}"}
         raw_response_text = llm_result.get("response", "")
     elif prov == "openai":
-        llm_result = await openai.chat(prompt)
+        llm_result = await _chat_with_telemetry("openai", openai.chat, prompt)
         if "error" in llm_result:
             return {"status": "error", "mensaje": f"Error del LLM (OpenAI): {llm_result['error']}"}
         raw_response_text = llm_result.get("response", "") or llm_result.get("text", "")
     elif prov in ["ollama", "onpremise", "local"]:
-        llm_result = await ollama.chat(prompt)
+        llm_result = await _chat_with_telemetry("ollama", ollama.chat, prompt)
         if "error" in llm_result:
             return {"status": "error", "mensaje": f"Error del LLM (Ollama On-Premise): {llm_result['error']}"}
         raw_response_text = llm_result.get("response", "") or llm_result.get("text", "")
     else:
-        llm_result = await modelo.chat(prompt)
+        llm_result = await _chat_with_telemetry("openrouter", modelo.chat, prompt)
         if "error" in llm_result:
             return {"status": "error", "mensaje": f"Error del LLM ({proveedor_llm}): {llm_result['error']}"}
         raw_response_text = llm_result.get("response", "") or llm_result.get("text", "")
@@ -1007,6 +1125,7 @@ def _generar_markdown_reporte(
 
 
 @mcp.tool()
+@_with_mcp_telemetry("guardar_reporte")
 async def guardar_reporte(
     id_entrega: str,
     datos_evaluacion: Dict[str, Any],
@@ -1100,6 +1219,7 @@ async def guardar_reporte(
 # ============================================================
 
 @mcp.tool()
+@_with_mcp_telemetry("consultar_modelos_gratuitos_openrouter")
 async def consultar_modelos_gratuitos_openrouter(forzar_refresco: bool = False) -> Dict[str, Any]:
     """
     Herramienta MCP para consultar en tiempo real el catálogo dinámico de modelos gratuitos de OpenRouter,
@@ -1185,8 +1305,154 @@ def _consolidar_desde_datos_eval(
         modelo=modelo,
     )
 
+def _assignment_context_id(institution_id: str, course_id: str, assignment_id: str) -> str:
+    return lms_activity_context_id(institution_id, course_id, assignment_id)
+
+
+def _assert_client_evaluation_access(
+    request: Optional[Request],
+    peticion: SolicitudEvaluacionDirecta,
+) -> None:
+    if request is None or getattr(request.state, "api_client", None) is None:
+        return
+    institution_id = (
+        peticion.institution_id
+        or request.headers.get("X-Institution-ID")
+        or DEFAULT_LMS_INSTITUTION_ID
+    )
+    from API.core.api_auth import assert_client_institution
+
+    assert_client_institution(request, institution_id)
+
+
+async def _prepare_assignment_context(
+    peticion: SolicitudEvaluacionDirecta,
+    store=None,
+) -> InstitutionalContext:
+    """Upsert the shared assignment context without student or submission data."""
+    store = store or context_store
+    active = get_current_context()
+    institution_id = (
+        peticion.institution_id
+        or (active.institution_id if active else None)
+        or DEFAULT_LMS_INSTITUTION_ID
+    ).strip()
+    institution_id = institution_id or DEFAULT_LMS_INSTITUTION_ID
+    course_id = (peticion.course_id or peticion.id_curso or "").strip()
+    assignment_id = (peticion.assignment_id or "").strip()
+
+    context_id = (
+        _assignment_context_id(institution_id, course_id, assignment_id)
+        if course_id and assignment_id
+        else None
+    )
+    ctx = await store.get_or_restore(context_id) if context_id else None
+    if context_id and peticion.context_id and peticion.context_id != context_id:
+        raise HTTPException(
+            status_code=409,
+            detail="El context_id del trabajo no coincide con institución, curso y tarea.",
+        )
+    if context_id and ctx is None and peticion.context_id:
+        raise HTTPException(
+            status_code=410,
+            detail="El contexto LMS del trabajo expiró o fue eliminado; inicialice nuevamente la actividad con sus datos comunes.",
+        )
+    if ctx is None and not context_id:
+        ctx = active
+    if ctx is None:
+        kwargs = {
+            "institution_id": institution_id,
+            "system_source": peticion.id_lms or "CANVAS",
+            "lifecycle_type": "activity" if context_id else "session",
+            "grace_period_days": (
+                peticion.context_grace_days
+                if peticion.context_grace_days is not None
+                else get_settings().lms_context_grace_days
+            ),
+        }
+        if context_id:
+            kwargs["context_id"] = context_id
+        ctx = InstitutionalContext(**kwargs)
+    elif context_id:
+        ctx.lifecycle_type = "activity"
+        if peticion.context_grace_days is not None:
+            ctx.grace_period_days = peticion.context_grace_days
+
+    assignment = peticion.assignment if isinstance(peticion.assignment, dict) else {}
+    allowed_metadata = {
+        "name", "description", "points_possible", "grading_type", "due_at",
+        "unlock_at", "lock_at", "published", "html_url", "id", "course_id",
+        "courseId",
+    }
+    assignment_metadata = {
+        key: value for key, value in assignment.items() if key in allowed_metadata
+    }
+    shared_lms = {
+        "course_id": course_id or None,
+        "assignment_id": assignment_id or None,
+    }
+    assignment_name = peticion.assignment_name or assignment.get("name")
+    assignment_description = (
+        peticion.assignment_description or assignment.get("description")
+    )
+    if assignment_name:
+        shared_lms["assignment_name"] = assignment_name
+    if assignment_description:
+        shared_lms["assignment_description"] = assignment_description
+    if assignment_metadata:
+        shared_lms["assignment_metadata"] = assignment_metadata
+    rubric = peticion.origen_rubrica or assignment.get("rubric")
+    if rubric is not None:
+        shared_lms["rubric"] = rubric
+    points_possible = assignment.get("points_possible")
+    if points_possible is not None:
+        try:
+            scale = float(points_possible)
+            if scale > 0:
+                ctx.evaluation_scale = scale
+                shared_lms["scale"] = scale
+        except (TypeError, ValueError):
+            pass
+    ctx.institution_id = institution_id
+    ctx.system_source = peticion.id_lms or ctx.system_source or "CANVAS"
+    ctx.user_id = None
+    if context_id and store.backend is None:
+        raise HTTPException(
+            status_code=503,
+            detail="La persistencia durable de contextos LMS no está disponible; configure DB_DSN antes de encolar.",
+        )
+    ctx.set_slot("lms", shared_lms)
+    lms_slot = ctx.get_slot("lms")
+    for private_key in (
+        "user_id_canvas", "user_id", "student_id", "student",
+        "submission_id", "submission_type", "submission",
+    ):
+        lms_slot.pop(private_key, None)
+    await store.save_durable(ctx)
+    return ctx
+
+
 @router.post("/evaluar-flujo-completo", tags=["Evaluador Ensayos"])
-async def evaluar_flujo_completo(peticion: SolicitudEvaluacionDirecta):
+async def evaluar_flujo_completo(
+    peticion: SolicitudEvaluacionDirecta,
+    request: Request,
+):
+    _assert_client_evaluation_access(request, peticion)
+    ctx = await _prepare_assignment_context(peticion)
+    from API.core.api_auth import assert_client_institution
+
+    assert_client_institution(request, ctx.institution_id)
+    with use_current_context(ctx):
+        result = await _evaluar_flujo_completo_impl(peticion)
+    result["context_id"] = ctx.context_id
+    return result
+
+
+async def _evaluar_flujo_completo_impl(
+    peticion: SolicitudEvaluacionDirecta,
+    *,
+    attempts_managed_by_queue: bool = False,
+):
     """
     Ejecuta el pipeline completo de las 3 herramientas en una sola llamada REST:
     1. obtener_ensayos -> 2. evaluar_con_rubrica -> 3. guardar_reporte
@@ -1195,7 +1461,7 @@ async def evaluar_flujo_completo(peticion: SolicitudEvaluacionDirecta):
     # Control de crónica de envíos (FASE 3): si `contar_intento` está activo se
     # verifica el límite por (course_id + assignment_id + user_id) antes de gastar
     # tokens, rechazando con 429 si el estudiante ya alcanzó el máximo permitido.
-    if peticion.contar_intento:
+    if peticion.contar_intento and not attempts_managed_by_queue:
         if not (peticion.course_id and peticion.assignment_id and peticion.user_id_canvas):
             logger.warning(
                 "Envío sin trazabilidad completa (course/assignment/user). Se evalúa pero no se registra intento."
@@ -1230,47 +1496,9 @@ async def evaluar_flujo_completo(peticion: SolicitudEvaluacionDirecta):
             except Exception as exc:
                 logger.warning("SubmissionTracker: no se pudo validar límite (%s); se continúa.", exc)
 
-    # Paso 0: Sincronizar o Instanciar Contexto Institucional Activo
-    # Garantiza que el curso, asignación, escala y directivas se inyecten en el System Prompt del LLM
     ctx = get_current_context()
-    if not ctx:
-        ctx = InstitutionalContext(
-            system_source=peticion.id_lms or "CANVAS",
-            user_id=peticion.user_id_canvas,
-            user_role="ESTUDIANTE",
-            slots={
-                "lms": {
-                    "course_id": peticion.course_id,
-                    "assignment_id": peticion.assignment_id,
-                    "assignment_name": peticion.assignment_name,
-                    "assignment_description": peticion.assignment_description,
-                    "submission_id": peticion.submission_id,
-                    "submission_type": peticion.submission_type,
-                    "rubric": peticion.origen_rubrica
-                }
-            }
-        )
-        context_store.save(ctx)
-        set_current_context(ctx)
-    else:
-        lms_update = {}
-        if peticion.course_id:
-            lms_update["course_id"] = peticion.course_id
-        if peticion.assignment_id:
-            lms_update["assignment_id"] = peticion.assignment_id
-        if peticion.assignment_name:
-            lms_update["assignment_name"] = peticion.assignment_name
-        if peticion.assignment_description:
-            lms_update["assignment_description"] = peticion.assignment_description
-        if peticion.submission_id:
-            lms_update["submission_id"] = peticion.submission_id
-        if peticion.submission_type:
-            lms_update["submission_type"] = peticion.submission_type
-        if peticion.origen_rubrica and not ctx.get_slot("lms").get("rubric"):
-            lms_update["rubric"] = peticion.origen_rubrica
-        if lms_update:
-            ctx.set_slot("lms", lms_update)
-            context_store.save(ctx)
+    if ctx is None:
+        raise RuntimeError("No se activó el contexto de evaluación")
 
     # Paso 1: Obtener documentos
     docs = await obtener_ensayos(peticion.origen_ensayo, peticion.origen_rubrica)
@@ -1280,6 +1508,13 @@ async def evaluar_flujo_completo(peticion: SolicitudEvaluacionDirecta):
     texto_ensayo = docs["ensayo"]["contenido_texto"]
     texto_rubrica = docs["rubrica"]["contenido_texto"]
     escala_sugerida = docs["rubrica"].get("metadatos", {}).get("escala_calculada")
+    if escala_sugerida:
+        try:
+            ctx.evaluation_scale = float(escala_sugerida)
+            ctx.get_slot("lms")["scale"] = float(escala_sugerida)
+            await context_store.save_durable(ctx)
+        except (TypeError, ValueError):
+            logger.warning("No se pudo guardar la escala de la rúbrica en el contexto compartido.")
 
     # Paso 2: Evaluar con rúbrica
     eval_res = await evaluar_con_rubrica(
@@ -1288,7 +1523,10 @@ async def evaluar_flujo_completo(peticion: SolicitudEvaluacionDirecta):
         proveedor_llm=peticion.proveedor_llm,
         instrucciones_adicionales=peticion.instrucciones_adicionales,
         escala_sugerida=escala_sugerida,
-        descripcion_tarea=peticion.assignment_description
+        descripcion_tarea=(
+            peticion.assignment_description
+            or ctx.get_slot("lms").get("assignment_description")
+        )
     )
 
     if eval_res.get("status") not in ["success", "partial_success"]:
@@ -1306,7 +1544,10 @@ async def evaluar_flujo_completo(peticion: SolicitudEvaluacionDirecta):
             proveedor_llm="modelo",
             instrucciones_adicionales=peticion.instrucciones_adicionales,
             escala_sugerida=escala_sugerida,
-            descripcion_tarea=peticion.assignment_description
+            descripcion_tarea=(
+                peticion.assignment_description
+                or ctx.get_slot("lms").get("assignment_description")
+            )
         )
         datos_eval = eval_res.get("evaluacion", {})
         modelo_calificador = eval_res.get("modelo_utilizado") or "modelo"
@@ -1322,11 +1563,11 @@ async def evaluar_flujo_completo(peticion: SolicitudEvaluacionDirecta):
     lms_slot = ctx.get_slot("lms") if ctx else {}
 
     course_id = peticion.course_id or peticion.id_curso or lms_slot.get("course_id")
-    user_id_canvas = peticion.user_id_canvas or peticion.id_usuario or (ctx.user_id if ctx else None)
+    user_id_canvas = peticion.user_id_canvas or peticion.id_usuario
     assignment_id = peticion.assignment_id or lms_slot.get("assignment_id")
     assignment_name = peticion.assignment_name or lms_slot.get("assignment_name")
-    submission_id = peticion.submission_id or peticion.id_submision or lms_slot.get("submission_id")
-    submission_type = peticion.submission_type or lms_slot.get("submission_type")
+    submission_id = peticion.submission_id or peticion.id_submision
+    submission_type = peticion.submission_type
     id_lms = peticion.id_lms or (ctx.system_source if ctx else "CANVAS")
 
     datos_lms = {
@@ -1337,6 +1578,10 @@ async def evaluar_flujo_completo(peticion: SolicitudEvaluacionDirecta):
         "assignment_name": assignment_name,
         "submission_id": submission_id,
         "submission_type": submission_type,
+        "assignment_description": (
+            peticion.assignment_description or lms_slot.get("assignment_description")
+        ),
+        "context_id": ctx.context_id,
         # Mantener compatibilidad histórica
         "id_curso": course_id,
         "id_usuario": user_id_canvas,
@@ -1368,7 +1613,14 @@ async def evaluar_flujo_completo(peticion: SolicitudEvaluacionDirecta):
     # activo y hay trazabilidad completa. Almacena la evaluación para métricas.
     intento_registrado = False
     intento_info: Dict[str, Any] = {}
-    if peticion.contar_intento and submission_id and user_id_canvas and course_id and assignment_id:
+    if (
+        peticion.contar_intento
+        and not attempts_managed_by_queue
+        and submission_id
+        and user_id_canvas
+        and course_id
+        and assignment_id
+    ):
         try:
             tracker = get_tracker()
             reg_ok, intento_info, _motivo = await tracker.register(
@@ -1391,6 +1643,15 @@ async def evaluar_flujo_completo(peticion: SolicitudEvaluacionDirecta):
         "pipeline": "completado",
         "evaluation_id": id_entrega_final,
         "submission_id": submission_id or "",
+        "context_id": ctx.context_id,
+        "institution_id": ctx.institution_id,
+        "user_id_canvas": user_id_canvas,
+        "course_id": course_id,
+        "assignment_id": assignment_id,
+        "assignment_name": assignment_name,
+        "assignment_description": (
+            peticion.assignment_description or lms_slot.get("assignment_description")
+        ),
         "modelo_utilizado": modelo_calificador,
         # --- Calificación y feedback directo ---
         "nota_final": datos_eval.get("nota_final"),
@@ -1437,20 +1698,47 @@ async def _evaluar_async_pipeline(payload_dict: Dict[str, Any]) -> Dict[str, Any
     `evaluar_flujo_completo`), sin duplicados.
     """
     req = SolicitudEvaluacionDirecta.model_validate(payload_dict)
-    resp = await evaluar_flujo_completo(req)
+    ctx = await _prepare_assignment_context(req)
+    with use_current_context(ctx):
+        resp = await _evaluar_flujo_completo_impl(
+            req, attempts_managed_by_queue=True
+        )
+    resp["context_id"] = ctx.context_id
+    user_id = req.user_id_canvas or req.id_usuario
+    course_id = req.course_id or req.id_curso
+    assignment_id = req.assignment_id
+    resp["intento"] = {
+        "contado": req.contar_intento,
+        "registrado": bool(
+            req.contar_intento and user_id and course_id and assignment_id
+        ),
+        "gestion": "evaluation_queue",
+    }
     if resp.get("status") != "EVALUADO":
         raise RuntimeError(resp.get("feedback") or "Evaluación fallida sin feedback")
     return resp
 
 
-@router.post("/webhook-canvas", tags=["Evaluador Ensayos"])
-async def webhook_canvas_entrypoint(peticion: SolicitudEvaluacionDirecta):
+@router.post("/webhook-canvas", tags=["Evaluador Ensayos"], status_code=202)
+async def webhook_canvas_entrypoint(
+    peticion: SolicitudEvaluacionDirecta,
+    request: Request,
+    idempotency_key: Annotated[
+        Optional[str], Header(alias="Idempotency-Key")
+    ] = None,
+):
     """
     Punto de entrada dedicado para webhooks del LMS Canvas.
     Acepta nativamente el payload estándar de Canvas (assignment + submission + attachment) tanto para
-    archivos descargables (.docx/.pdf) como para envíos de texto plano.
+    archivos descargables (.docx/.pdf) como para envíos de texto plano. Encola la evaluación y
+    devuelve su identificador para que Canvas consulte el estado posteriormente.
     """
-    return await evaluar_flujo_completo(peticion)
+    return JSONResponse(
+        status_code=202,
+        content=await _encolar_evaluacion(
+            peticion, request=request, idempotency_key=idempotency_key
+        ),
+    )
 
 
 # ============================================================
@@ -1461,25 +1749,89 @@ async def webhook_canvas_entrypoint(peticion: SolicitudEvaluacionDirecta):
 # El evaluador del worker es `_evaluar_async_pipeline` (definido arriba).
 # ============================================================
 
-@router.post("/enqueue", tags=["Evaluador Ensayos"])
-async def enqueue_evaluacion(peticion: SolicitudEvaluacionDirecta):
+@router.post("/enqueue", tags=["Evaluador Ensayos"], status_code=202)
+async def enqueue_evaluacion(
+    peticion: SolicitudEvaluacionDirecta,
+    request: Request,
+    idempotency_key: Annotated[
+        Optional[str], Header(alias="Idempotency-Key")
+    ] = None,
+):
     """
     Encola una evaluación en el modo ASÍNCRONO.
     Responde 202 de inmediato con `evaluation_id` y estado PENDING; el LMS debe
     consultar `GET /ensayos/estado/{evaluation_id}` hasta que esté EVALUADO.
     No espera al LLM ni gasta la respuesta.
     """
+    return JSONResponse(
+        status_code=202,
+        content=await _encolar_evaluacion(
+            peticion, request=request, idempotency_key=idempotency_key
+        ),
+    )
+
+
+async def _encolar_evaluacion(
+    peticion: SolicitudEvaluacionDirecta,
+    *,
+    request: Optional[Request] = None,
+    idempotency_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Prepara el contexto compartido y encola una evaluación sin ejecutar el LLM."""
+    principal = getattr(request.state, "api_client", None) if request else None
+    _assert_client_evaluation_access(request, peticion)
+    ctx = await _prepare_assignment_context(peticion)
+    if request is not None:
+        from API.core.api_auth import assert_client_institution
+
+        assert_client_institution(request, ctx.institution_id)
     payload = peticion.model_dump(mode="json")
-    manager = get_manager()
+    payload["context_id"] = ctx.context_id
+    payload["max_attempts_snapshot"] = (
+        peticion.max_intentos
+        if peticion.max_intentos is not None
+        else get_settings().max_submission_attempts
+    )
+    if idempotency_key and len(idempotency_key) > 255:
+        raise HTTPException(status_code=400, detail="Idempotency-Key excede 255 caracteres")
+    authorization = request.headers.get("Authorization", "") if request else ""
+    token = authorization.partition(" ")[2].strip()
+    client_id = (
+        principal.client_id
+        if principal is not None
+        else hashlib.sha256(token.encode("utf-8")).hexdigest() if token else None
+    )
     try:
-        info = await manager.enqueue(payload)
+        info = await get_manager().enqueue(
+            payload,
+            idempotency_client_id=client_id if idempotency_key else None,
+            idempotency_key=idempotency_key,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except AttemptLimitExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"No se pudo encolar: {exc}")
-    return {"status": "ENCOLADO", "estado": info.get("estado"), "evaluation_id": info.get("evaluation_id")}
+        logger.error("No se pudo persistir la evaluación en la cola durable: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Servicio de evaluación temporalmente no disponible",
+        ) from exc
+    return {
+        "status": "ENCOLADO",
+        "estado": info.get("estado"),
+        "evaluation_id": info.get("evaluation_id"),
+        "institution_id": ctx.institution_id,
+        **{
+            key: info[key]
+            for key in ("context_id", "submission_id", "user_id_canvas", "course_id", "assignment_id")
+            if key in info
+        },
+    }
 
 
 @router.get("/estado/{evaluation_id}", tags=["Evaluador Ensayos"])
-async def estado_evaluacion(evaluation_id: str):
+async def estado_evaluacion(evaluation_id: str, request: Request):
     """
     Consulta el estado de una evaluación asíncrona.
       - PENDING / EVALUATING → aún no evaluado (el LMS puede reintentar).
@@ -1487,7 +1839,16 @@ async def estado_evaluacion(evaluation_id: str):
       - ERROR → devuelve el motivo.
     """
     manager = get_manager()
-    code, body = await manager.get_status(evaluation_id)
+    principal = getattr(request.state, "api_client", None)
+    if principal is not None and principal.tenant_id is not None:
+        return JSONResponse(
+            status_code=404,
+            content={"estado": "NOT_FOUND", "evaluation_id": evaluation_id},
+        )
+    code, body = await manager.get_status(
+        evaluation_id,
+        institution_id=principal.institution_id if principal is not None else None,
+    )
     return JSONResponse(status_code=code, content=body)
 
 
@@ -1506,6 +1867,14 @@ def init_async_evaluator() -> None:
     get_manager()._evaluator = _evaluar_async_pipeline
 
 
+def _create_mcp_http_app():
+    from API.core.api_auth import BearerTokenMiddleware, get_api_token
+
+    http_app = mcp.streamable_http_app()
+    http_app.add_middleware(BearerTokenMiddleware, token_provider=get_api_token)
+    return http_app
+
+
 # ============================================================
 # RUN STANDALONE MCP SERVER
 # ============================================================
@@ -1516,4 +1885,18 @@ if __name__ == "__main__":
     if "--http" in sys.argv:
         transport = "streamable-http"
     logger.info("Iniciando Servidor MCP de Evaluación de Ensayos (transporte: %s)...", transport)
-    mcp.run(transport=transport)
+    if transport == "streamable-http":
+        import uvicorn
+
+        if not get_settings().hub_api_token:
+            logger.error(
+                "HUB_API_TOKEN no configurado; las solicitudes MCP HTTP responderán HTTP 503."
+            )
+        uvicorn.run(
+            _create_mcp_http_app(),
+            host=mcp.settings.host,
+            port=mcp.settings.port,
+            log_level=mcp.settings.log_level.lower(),
+        )
+    else:
+        mcp.run(transport=transport)

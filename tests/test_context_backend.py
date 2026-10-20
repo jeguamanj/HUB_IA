@@ -42,6 +42,29 @@ class TestContextRecord:
         rec2 = ContextRecord("c1", now, 3600, {})
         assert rec2.is_expired(now) is False
 
+    def test_activity_lifecycle_ignores_session_ttl_until_closed(self):
+        now = time.time()
+        active = ContextRecord(
+            "activity",
+            now - 5000,
+            3600,
+            {"lifecycle_type": "activity", "lifecycle_status": "active"},
+        )
+        assert active.is_expired(now) is False
+
+        closed = ContextRecord(
+            "activity",
+            now - 5000,
+            3600,
+            {
+                "lifecycle_type": "activity",
+                "lifecycle_status": "closed",
+                "retention_until": now + 3 * 86400,
+            },
+        )
+        assert closed.is_expired(now) is False
+        assert closed.is_expired(now + 3 * 86400 + 1) is True
+
     def test_dict_to_record_handles_json_string(self):
         # data puede venir serializada como JSON string.
         rec = ContextBackend.dict_to_record(
@@ -149,3 +172,49 @@ class TestFactoryConmutacion:
             assert backend.name in ("sqlalchemy", "memory")
             assert hasattr(backend, "create")
             assert hasattr(backend, "get")
+
+
+def test_concurrent_context_reads_use_independent_sessions():
+    from sqlalchemy import Text
+    from sqlalchemy.orm import DeclarativeBase, mapped_column
+
+    class Base(DeclarativeBase):
+        pass
+
+    class Row(Base):
+        __tablename__ = "concurrent_contexts"
+        context_id = mapped_column(Text, primary_key=True)
+
+    sessions = []
+
+    class Result:
+        def scalar_one_or_none(self):
+            return None
+
+    class Session:
+        async def __aenter__(self):
+            sessions.append(self)
+            return self
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            return False
+
+        async def execute(self, statement):
+            await asyncio.sleep(0.01)
+            return Result()
+
+    async def scenario():
+        backend = make_context_backend("postgresql+asyncpg://localhost/db")
+
+        async def ready():
+            return None
+
+        backend._ensure_ready = ready
+        backend._SessionLocal = Session
+        backend._row_model = Row
+        await asyncio.gather(backend.get("context-1"), backend.get("context-2"))
+
+    run(scenario())
+
+    assert len(sessions) == 2
+    assert sessions[0] is not sessions[1]

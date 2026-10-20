@@ -119,3 +119,30 @@ class TestFactory:
         b = make_submission_backend("sqlite+aiosqlite:///./storage/sub.db")
         assert b.name in ("sqlalchemy", "memory")
         assert hasattr(b, "register") and hasattr(b, "count_group")
+
+    def test_sqlalchemy_backend_initializes_and_persists(self, tmp_path):
+        async def scenario():
+            dsn = f"sqlite+aiosqlite:///{tmp_path / 'submissions.db'}"
+            first = SubmissionTracker(backend=make_submission_backend(dsn))
+            await first.initialize()
+            assert first.backend.name == "sqlalchemy"
+            await first.register(
+                submission_id="S1",
+                user_id="U1",
+                course_id="C1",
+                assignment_id="A1",
+                nota=8.0,
+            )
+            await first.backend.close()
+
+            second = SubmissionTracker(backend=make_submission_backend(dsn))
+            await second.initialize()
+            assert second.backend.name == "sqlalchemy"
+            assert await second.backend.count_group(
+                user_id="U1",
+                course_id="C1",
+                assignment_id="A1",
+            ) == 1
+            await second.backend.close()
+
+        asyncio.run(scenario())

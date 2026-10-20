@@ -45,6 +45,9 @@ class SubmissionBackend:
 
     name = "abstract"
 
+    async def initialize(self) -> None:
+        """Prepare the backend before it is used."""
+
     async def register(
         self,
         *,
@@ -169,7 +172,7 @@ class SQLAlchemySubmissionBackend(SubmissionBackend):
         if self._ready:
             return
         try:
-            from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+            from sqlalchemy.orm import DeclarativeBase, mapped_column
             from sqlalchemy import Text, Integer, Float, PrimaryKeyConstraint
             from sqlalchemy.ext.asyncio import (
                 AsyncSession,
@@ -192,26 +195,30 @@ class SQLAlchemySubmissionBackend(SubmissionBackend):
                 __table_args__ = (
                     PrimaryKeyConstraint("course_id", "assignment_id", "user_id"),
                 )
-                course_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-                assignment_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-                user_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
+                course_id = mapped_column(Text, nullable=False, default="")
+                assignment_id = mapped_column(Text, nullable=False, default="")
+                user_id = mapped_column(Text, nullable=False, default="")
                 # Último submission_id y resultado evaluado (historia del grupo).
-                submission_id: Mapped[str] = mapped_column(Text, nullable=False, default="")
-                nota: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-                escala_maxima: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-                modelo: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-                intentos: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-                created_at: Mapped[float] = mapped_column(Float, nullable=False)
-                last_evaluated_at: Mapped[float] = mapped_column(Float, nullable=False)
+                submission_id = mapped_column(Text, nullable=False, default="")
+                nota = mapped_column(Float, nullable=True)
+                escala_maxima = mapped_column(Float, nullable=True)
+                modelo = mapped_column(Text, nullable=True)
+                intentos = mapped_column(Integer, nullable=False, default=0)
+                created_at = mapped_column(Float, nullable=False)
+                last_evaluated_at = mapped_column(Float, nullable=False)
 
             self._engine = create_async_engine(self.dsn)
             self._SessionLocal = async_sessionmaker(self._engine, class_=AsyncSession, expire_on_commit=False)
             self._Row = SubmissionRow
-            async with self._engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
+            if not self.dsn.startswith(("postgresql+", "postgres+")):
+                async with self._engine.begin() as conn:
+                    await conn.run_sync(Base.metadata.create_all)
             self._ready = True
         except Exception as exc:
             raise RuntimeError(f"No se pudo inicializar SubmissionTracker: {exc}") from exc
+
+    async def initialize(self) -> None:
+        await self._ensure_ready()
 
     async def _get_session(self):
         await self._ensure_ready()
@@ -361,7 +368,8 @@ def _make_memory_backend() -> InMemorySubmissionBackend:
 
 def make_submission_backend(dsn: Optional[str] = None, *, logger_override=None) -> SubmissionBackend:
     """
-    Resuelve el backend de envíos. Degrada a memoria si la BD no está disponible.
+    Resuelve el backend de envíos. La conexión se prepara de forma asíncrona
+    desde SubmissionTracker.initialize().
     """
     dsn = (dsn or "").strip()
     log = logger_override or logger
@@ -380,19 +388,7 @@ def make_submission_backend(dsn: Optional[str] = None, *, logger_override=None) 
         log.warning("SubmissionTracker: sqlalchemy no instalado → memoria.")
         return _make_memory_backend()
 
-    try:
-        backend = SQLAlchemySubmissionBackend(dsn)
-        import asyncio
-
-        async def _probe():
-            await backend._ensure_ready()
-            await backend.close()
-
-        asyncio.run(_probe())
-        return backend
-    except Exception as exc:
-        log.warning("SubmissionTracker: no se pudo usar '%s' (%s) → memoria.", dsn, exc)
-        return _make_memory_backend()
+    return SQLAlchemySubmissionBackend(dsn)
 
 
 class SubmissionTracker:
@@ -403,6 +399,21 @@ class SubmissionTracker:
     def __init__(self, backend: Optional[SubmissionBackend] = None, max_attempts: int = DEFAULT_MAX_ATTEMPTS):
         self.backend = backend or _make_memory_backend()
         self.max_attempts = max_attempts
+
+    async def initialize(self) -> None:
+        """Initialize durable storage without nesting event loops."""
+        try:
+            await self.backend.initialize()
+        except Exception as exc:
+            logger.warning(
+                "SubmissionTracker: no se pudo inicializar el backend durable (%s) → memoria.",
+                exc,
+            )
+            await self.backend.close()
+            self.backend = _make_memory_backend()
+
+    async def close(self) -> None:
+        await self.backend.close()
 
     async def check_and_register(
         self,

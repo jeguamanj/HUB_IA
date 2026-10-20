@@ -2,6 +2,213 @@
 
 Esta guía describe cómo levantar y utilizar el microservicio de evaluación automatizada de ensayos académicos con rúbricas pedagógicas mediante LLMs con fallback inteligente, soporte nativo para **Canvas LMS** y adaptación genérica a cualquier sistema LMS (Moodle, Blackboard, etc.).
 
+## Autenticación HTTP
+
+### Modo de staging y producción: credenciales individuales
+
+En staging y producción se usan credenciales opacas individuales por
+integración, guardadas como hashes en PostgreSQL y limitadas por institución,
+tenant y scopes. Configura `API_CLIENT_AUTH_ENABLED=true`; en este modo el
+bearer compartido descrito en la sección local no autoriza operaciones.
+`GET /health` y `GET /ready` son las únicas rutas públicas.
+
+Para emitir una credencial, configura `DB_DSN` en el entorno seguro del
+operador, aplica las migraciones iniciando el HUB y ejecuta el comando
+administrativo fuera de banda. La credencial se imprime una sola vez:
+
+```powershell
+python -m API.core.manage_api_clients issue `
+  --name "Canvas staging" `
+  --institution-id "institution-001" `
+  --scopes "essays:submit,essays:read,context:read,context:write,llm:chat" `
+  --actor "operador-institucional" `
+  --expires-at "2027-10-20T00:00:00+00:00"
+```
+
+Guarda el token directamente en el gestor de secretos del consumidor. PostgreSQL
+conserva únicamente SHA-256. La expiración y el actor son obligatorios; no
+incluyas el token en código, documentación, tickets ni logs.
+
+Rota o revoca con el `client_id` devuelto al emitir:
+
+```powershell
+python -m API.core.manage_api_clients rotate `
+  --client-id "<client-id>" `
+  --actor "operador-institucional" `
+  --expires-at "2027-10-20T00:00:00+00:00"
+
+python -m API.core.manage_api_clients revoke `
+  --client-id "<client-id>" `
+  --actor "operador-institucional"
+```
+
+Lista metadatos sin secretos; por defecto omite credenciales revocadas:
+
+```powershell
+python -m API.core.manage_api_clients list
+python -m API.core.manage_api_clients list --include-revoked
+```
+
+Cada solicitud debe enviar `X-Institution-ID` igual al valor asignado al token.
+Si la credencial tiene `tenant_id`, también debe enviar el mismo
+`X-Tenant-ID`. Scopes permitidos: `context:read`, `context:write`,
+`context:close`, `context:delete`, `echo:use`, `essays:read`, `essays:submit`,
+`llm:chat` y `llm:read`. Los scopes de ensayo
+solo se asignan a clientes ligados a una institución porque `evaluation_jobs`
+aún no persiste ownership por tenant. El listado global de contextos, Zoom y
+MCP remoto están denegados en este modo hasta que tengan aislamiento
+verificable. Un `403` indica scope o ámbito insuficiente.
+
+### Modo local heredado
+
+Las instrucciones siguientes que usan `HUB_API_TOKEN` aplican únicamente al
+modo local de desarrollo. No publiques ese modo en staging ni en Internet.
+
+Las operaciones de contexto, evaluación, LLM y Zoom requieren un token Bearer
+configurado en `HUB_API_TOKEN`. La documentación web (`/docs`, `/redoc` y
+`/openapi.json`) usa usuario y contraseña HTTP Basic propios, configurados en
+`HUB_DOCS_USERNAME` y `HUB_DOCS_PASSWORD`; no son el Bearer del API. La única
+En modo local, `GET /health` y `GET /ready` son públicas.
+
+Configura un secreto aleatorio y privado en el `.env` local o en el gestor de
+secretos del entorno:
+
+```ini
+HUB_API_TOKEN=<secreto-aleatorio-largo>
+HUB_DOCS_USERNAME=<usuario-para-documentacion>
+HUB_DOCS_PASSWORD=<contraseña-larga-para-documentacion>
+```
+
+No publiques estos valores en el repositorio, documentación, logs ni código
+cliente. Si faltan el usuario o la contraseña de documentación, las rutas de
+Swagger responden `503`; credenciales Basic incorrectas responden `401`. Si
+falta `HUB_API_TOKEN`, las operaciones protegidas responden `503`.
+
+### Abrir Swagger desde el navegador
+
+1. Configura `HUB_DOCS_USERNAME` y `HUB_DOCS_PASSWORD` en el `.env` local o en
+   el gestor de secretos del entorno. Son credenciales únicamente para abrir la
+   documentación.
+2. Configura `HUB_API_TOKEN` por separado. Este token autoriza las llamadas a
+   las operaciones del API y no debe ser igual a las credenciales de docs.
+3. Reinicia el servidor y abre `http://localhost:10000/docs` (o `/redoc`).
+   El navegador solicitará usuario y contraseña HTTP Basic. `/openapi.json`
+   también requiere esas credenciales para cargar el esquema.
+4. En Swagger, pulsa **Authorize** y proporciona el Bearer token del API.
+   Swagger lo enviará en las llamadas a operaciones protegidas. Tener acceso a
+   la interfaz no concede por sí solo permisos sobre el API.
+
+Basic Auth no cifra las credenciales; fuera de `localhost`, accede únicamente
+mediante HTTPS. No expongas directamente Uvicorn a Internet: utiliza el gateway
+o proxy HTTPS aprobado para el entorno.
+
+### Consumo paso a paso
+
+1. **Configura el token en el servidor.** Genera un secreto aleatorio largo con
+   un gestor de contraseñas o de secretos. En desarrollo local, guárdalo en
+   `.env` (archivo ignorado por Git); en producción, usa el gestor de secretos
+   de la plataforma y no un archivo dentro de la imagen o del repositorio.
+   Reinicia el servidor después de cambiar la variable: la configuración se
+   carga al iniciar el proceso.
+2. **Prepara el consumidor autorizado.** Canvas, N8N o el cliente que llama al
+   HUB debe recuperar el mismo secreto desde su propio almacén de secretos y
+   exponerlo al proceso cliente como la variable `HUB_API_TOKEN`; el ejemplo de
+   PowerShell de abajo la utiliza desde el entorno del proceso. No lo incluyas
+   en el código fuente, JavaScript del navegador, URLs, payloads, capturas de
+   pantalla ni logs.
+3. **Inicia el servidor** como se indica en la sección 1. Si `HUB_API_TOKEN` no
+   está configurado, el proceso puede iniciar, pero las rutas protegidas
+   responden `503`; configura el secreto y reinicia.
+4. **Comprueba la disponibilidad** sin enviar credenciales. Solo `GET /health`
+   es público:
+
+   ```powershell
+   Invoke-RestMethod -Method Get -Uri "http://localhost:10000/health"
+   ```
+
+   Debe responder `{"status":"ok"}`. Este endpoint solo confirma que la
+   aplicación responde; no valida la conexión con PostgreSQL, Canvas ni los
+   proveedores LLM.
+5. **Llama una operación protegida** añadiendo el header
+   `Authorization: Bearer <token>`. El siguiente ejemplo usa una variable de
+   entorno que el cliente debe obtener de forma segura desde su gestor de
+   secretos:
+
+```powershell
+$headers = @{
+    "Content-Type" = "application/json"
+    "Authorization" = "Bearer $env:HUB_API_TOKEN"
+}
+Invoke-RestMethod -Method Post `
+  -Uri "http://localhost:10000/llm/chat" `
+  -Headers $headers `
+  -Body '{"prompt":"Hola"}'
+```
+
+6. **Para encolar una evaluación**, envía el header en `/ensayos/enqueue`.
+   Sustituye el texto y la rúbrica de ejemplo por los datos de la entrega; el
+   payload completo y sus campos admitidos se detallan en la sección 3:
+
+   ```powershell
+   $payload = @{
+       id_entrega = "ENTREGA_001"
+       origen_ensayo = "Texto del ensayo del estudiante..."
+       origen_rubrica = @(
+           @{
+               id = "criterio_1"
+               points = 10
+               description = "Argumentación y uso de evidencia"
+               ratings = @(
+                   @{ id = "nivel_1"; points = 10; description = "Argumentación sólida y sustentada" },
+                   @{ id = "nivel_2"; points = 5; description = "Argumentación parcial" },
+                   @{ id = "nivel_3"; points = 0; description = "No presenta argumentación" }
+               )
+           }
+       )
+       proveedor_llm = "modelo"
+   } | ConvertTo-Json -Depth 8
+
+   $acuse = Invoke-RestMethod -Method Post `
+       -Uri "http://localhost:10000/ensayos/enqueue" `
+       -Headers $headers `
+       -Body $payload
+
+   $acuse
+   ```
+
+   Una respuesta `202 Accepted` significa que se aceptó el trabajo, no que la
+   evaluación haya terminado. Guarda el `evaluation_id` devuelto.
+7. **Consulta el resultado** usando el mismo header y el identificador recibido:
+
+   ```powershell
+   $evaluationId = $acuse.evaluation_id
+   Invoke-RestMethod -Method Get `
+       -Uri "http://localhost:10000/ensayos/estado/$evaluationId" `
+       -Headers $headers
+   ```
+
+   Si el estado es `PENDING` o `EVALUATING`, espera y vuelve a consultar. Usa el
+   resultado canónico cuando el trabajo termine; no trates el acuse `202` como
+   una calificación.
+8. **Usa Swagger opcionalmente** en `/docs`: primero autentícate con las
+   credenciales Basic del paso «Abrir Swagger desde el navegador»; después pulsa
+   **Authorize** y pega el valor del Bearer token del API (sin escribir
+   `Bearer `). Son credenciales distintas. Luego ejecuta la operación protegida.
+
+**Respuestas de autenticación**
+
+| HTTP | Significado | Acción |
+|---|---|---|
+| `401 Unauthorized` | Falta o no coincide el Bearer del API en una operación, o el usuario/contraseña Basic no coincide en documentación. | Verifica qué credencial corresponde al recurso solicitado. |
+| `403 Forbidden` | Reservado para controles de autorización/permisos cuando se habiliten. | Solicita al administrador los permisos necesarios; no compartas credenciales de mayor privilegio. |
+| `503 Service Unavailable` | Falta `HUB_API_TOKEN` para operaciones o falta `HUB_DOCS_USERNAME`/`HUB_DOCS_PASSWORD` para documentación. | Configura el secreto correspondiente y reinicia la aplicación. |
+
+El MCP remoto iniciado con `--http` requiere el mismo header Bearer. Para STDIO,
+que no es HTTP, el acceso depende de quién pueda ejecutar el proceso y acceder
+a su configuración local. El token compartido actual es una protección inicial:
+no lo reutilices entre clientes no confiables; la gestión de tokens separados
+por consumidor y su revocación individual están previstas en el plan de seguridad.
+
 ---
 
 ## 1. 🚀 Levantar el Servidor
@@ -13,6 +220,7 @@ uv run uvicorn API.server:app --reload --port 10000
 ```
 
 - **URL Base:** `http://localhost:10000`
+- **Healthcheck público:** `http://localhost:10000/health`
 - **Documentación Interactiva (Swagger UI):** `http://localhost:10000/docs`
 - **Documentación Alternativa (Redoc):** `http://localhost:10000/redoc`
 
@@ -28,22 +236,26 @@ uv run uvicorn API.server:app --reload --port 10000
 | `POST` | `/context/init` | **Inicializar Contexto Institucional**: Registra sesión institucional y genera `context_id` para reusar en todas las herramientas sin reenviar prompts pesados. |
 | `GET` | `/context/{context_id}` | Consulta el estado y las ranuras activas de una sesión de contexto institucional. |
 | `POST` | `/context/{context_id}/slot/{slot_name}` | Actualiza o enriquece una ranura de herramienta (`lms`, `zoom`, `crm`, `custom`). |
+| `POST` | `/context/{context_id}/close` | Cierra una actividad LMS e inicia su período de gracia configurable. |
 | `DELETE` | `/context/{context_id}` | Elimina una sesión de contexto institucional. |
 | `GET` | `/context/active/current` | Inspecciona el contexto inyectado automáticamente en la solicitud actual. |
-| `POST` | `/ensayos/evaluar-flujo-completo` | **Evaluador de Ensayos**: Extrae documentos, califica con rúbrica, inyecta contexto institucional, genera reportes y mapea a Canvas LMS. |
-| `POST` | `/ensayos/webhook-canvas` | **Receptor Webhook Canvas LMS**: Endpoint dedicado para recibir eventos de entrega de Canvas (archivo adjunto por URL o texto plano). |
+| `GET` | `/health` | Healthcheck mínimo público; no requiere autenticación. |
+| `POST` | `/ensayos/evaluar-flujo-completo` | **Evaluador síncrono**: procesa la entrega y devuelve el resultado completo al terminar. |
+| `POST` | `/ensayos/webhook-canvas` | **Webhook asíncrono Canvas LMS**: recibe una entrega, la encola y responde `202 Accepted` con `evaluation_id` y correlación. |
+| `POST` | `/ensayos/enqueue` | Encola una evaluación directa y responde `202 Accepted`, sin esperar al LLM. |
+| `GET` | `/ensayos/estado/{evaluation_id}` | Consulta el estado o recupera el resultado canónico de una evaluación encolada. |
 | `POST` | `/llm/chat` | Chat directo con LLMs con soporte para contexto institucional, fallback OpenRouter (`modelo`) y On-Premise (`ollama`). |
 | `GET` | `/llm/ollama/status` | Verifica disponibilidad y conexión con el servidor On-Premise local de Ollama. |
 | `GET` | `/llm/ollama/models` | Lista modelos instalados en la instancia local de Ollama. |
 | `GET` | `/llm/models/free` | Consulta en vivo el catálogo dinámico de modelos gratuitos de OpenRouter con context length, reasoning y ranking. |
 | `POST` | `/llm/models/refresh` | Fuerza la actualización inmediata de la caché de modelos gratuitos de OpenRouter. |
-| `GET` | `/docs` | Interfaz interactiva de Swagger UI para pruebas directas desde el navegador. |
+| `GET` | `/docs` | Interfaz interactiva de Swagger UI protegida por usuario y contraseña HTTP Basic; las operaciones requieren Bearer token. |
 
 ---
 
 ## 3. 📝 Estructura del Payload de Entrada
 
-El servicio admite **dos modalidades de entrada transparentes**: el payload nativo del **Webhook de Canvas LMS** (con archivo o texto) y el formato directo explícito. Ambos pueden enviarse indistintamente a `POST /ensayos/evaluar-flujo-completo` o a `POST /ensayos/webhook-canvas`.
+El servicio admite el payload nativo del **Webhook de Canvas LMS** (con archivo o texto) y el formato directo explícito. El webhook Canvas y `/ensayos/enqueue` encolan el trabajo y responden `202`; `/ensayos/evaluar-flujo-completo` conserva el procesamiento síncrono para integraciones que necesitan esperar el resultado en la misma petición.
 
 ### 3.1. Modalidad A: Payload Nativo de Webhook Canvas LMS
 
@@ -171,12 +383,13 @@ Para tareas donde el alumno redacta directamente en el editor web de Canvas:
 
 En entornos de producción masiva con cientos de estudiantes por aula, enviar la rúbrica completa (`assignment.rubric`), la descripción logística de la actividad (`assignment.description`) y los datos del curso en cada webhook de cada estudiante representa un desperdicio enorme de ancho de banda y tokens.
 
-Para evitar esto, el HUB permite vincular la entrega al contexto de la tarea mediante el header `X-Context-ID`:
-- **Header:** `X-Context-ID: ctx_utpl_curso79871_tarea992586`
-- **Payload mínimo enviado por el Webhook de Canvas:**
+Para evitar repetir datos comunes, el HUB comparte y persiste automáticamente el contexto por `institution_id`, `course_id` y `assignment_id`. La primera entrega del lote debe aportar la asignación/rúbrica, o la integración debe haberla precargado en el contexto LMS. Las siguientes entregas pueden omitir descripción y rúbrica, pero deben conservar los IDs de institución, curso y tarea para que el HUB resuelva el mismo contexto:
 
 ```json
 {
+  "institution_id": "UNIVERSIDAD_TECNICA_PARTICULAR_DE_LOJA_UTPL",
+  "course_id": "79871",
+  "assignment_id": "992586",
   "submission": {
     "id": "57423885",
     "userId": "182199",
@@ -189,7 +402,9 @@ Para evitar esto, el HUB permite vincular la entrega al contexto de la tarea med
 }
 ```
 
-*El HUB recupera automáticamente la rúbrica del slot LMS del contexto, descarga el archivo .docx/.pdf del estudiante, y evalúa el ensayo aplicando la escala institucional sin duplicar la rúbrica en la red ni enviar metadatos administrativos al LLM.*
+La primera solicitud puede usar el payload Canvas completo de la sección 3.1; las solicitudes posteriores del mismo lote reutilizan el contexto persistido. Para el flujo de evaluación LMS, la identidad compartida se deriva de institución/curso/tarea; un `X-Context-ID` arbitrario no sustituye ni cambia esa identidad. El header sigue disponible para las demás rutas que usan el middleware de contexto institucional.
+
+*El HUB descarga el archivo .docx/.pdf del estudiante, obtiene la rúbrica del contexto compartido y encola el trabajo. La respuesta inicial es `202 Accepted`; consulta luego `/ensayos/estado/{evaluation_id}` para recibir la calificación.*
 
 ---
 
@@ -1146,9 +1361,9 @@ El **Inyector de Contexto Institucional** es el núcleo de gobernanza y equidad 
 ### 13.1. Tres Pilares de Diseño:
 
 1. **💰 Ahorro Drástico de Tokens (Token Savings):**
-   - En lugar de enviar directivas institucionales, políticas de evaluación y descriptores (500 a 2,000 tokens) en cada prompt de cada herramienta, el contexto se inicializa **una sola vez** (`POST /context/init`).
-   - Las peticiones subsecuentes únicamente envían el encabezado HTTP: `X-Context-ID: ctx_abc123`.
-   - **Ahorro:** En un flujo de 1,000 evaluaciones con 5 nodos de N8N, se ahorran más de **5 millones de tokens**, reduciendo drásticamente costos y latencias.
+   - El contexto institucional y los datos comunes de Canvas pueden inicializarse una vez y referenciarse con `X-Context-ID`, en vez de repetirlos en cada payload del LMS.
+   - El ahorro del slot LMS corresponde al transporte y procesamiento de datos repetidos (`assignment.description`, título y rúbrica) entre el LMS y el HUB. Su magnitud depende del tamaño de esos campos y del número de entregas; no se debe extrapolar una cifra fija sin medir el payload real.
+   - El ahorro de tokens de inferencia corresponde al bloque institucional compilado. La rúbrica y el texto del ensayo siguen siendo insumos necesarios para evaluar cada estudiante y no se cuentan como datos eliminados por el slot.
 
 2. **⚖️ Equidad y Coherencia Transversal (Context Equity):**
    - Todos los modelos y herramientas consultan `get_current_context()`.
@@ -1166,7 +1381,7 @@ El **Inyector de Contexto Institucional** es el núcleo de gobernanza y equidad 
 
 3. **🧩 Escalabilidad Modular por Ranuras (Domain Slots):**
    - El contexto divide la información en **ranuras aisladas** (`slots`):
-     - `slots["lms"]`: `course_id`, `assignment_id`, `rubric_scale`
+     - `slots["lms"]`: `course_id`, `assignment_id`, `assignment_name`, `assignment_description`, `scale`, `rubric`
      - `slots["zoom"]`: `account_id`, `recording_policy`
      - `slots["crm"]`: `customer_id`, `lead_status`
      - `slots["custom"]`: Claves libres para nuevas herramientas MCP
@@ -1302,8 +1517,8 @@ Si no deseas inicializar una sesión previa, puedes enviar encabezados instituci
 
 #### Modo 3: Integración en N8N (Flujo Automatizado)
 
-1. **Nodo 1 (HTTP Request):** Invoca `POST /context/init` al inicio del workflow y extrae `{{ $json.context_id }}`.
-2. **Nodos Intermedios (Tools):** Configura el header `X-Context-ID: {{ $('Nodo 1').item.json.context_id }}` en todos los nodos que consuman el HUB (`/llm/chat`, `/ensayos/evaluar-flujo-completo`, reportes Zoom, etc.).
+1. **Nodo 1 (HTTP Request):** Invoca `POST /context/init` al inicio del workflow y extrae `{{ $json.context_id }}` para los servicios que usan el contexto general.
+2. **Nodos Intermedios (Tools):** Configura el header `X-Context-ID: {{ $('Nodo 1').item.json.context_id }}` en los nodos que consumen ese contexto general (`/llm/chat`, reportes Zoom, etc.). Para evaluaciones LMS, envía `institution_id`, `course_id` y `assignment_id`; el HUB deriva y persiste automáticamente el contexto compartido de la tarea.
 3. **Nodo Enriquecedor:** Si el flujo obtiene datos adicionales (ej. ID de reunión Zoom o ID de entrega Canvas), ejecuta `POST /context/{context_id}/slot/lms` para actualizar la sesión.
 4. **Nodo Final (Opcional):** Ejecuta `DELETE /context/{context_id}` o permite que expire por su TTL.
 
@@ -1397,48 +1612,60 @@ Lista los modelos descargados en la máquina local (ej. `llama3.3`, `mistral`, `
 ### 15.1. El Problema del Desperdicio de Tokens en Webhooks Académicos
 
 En las integraciones tradicionales entre LMS (Canvas LMS, Moodle) y modelos LLM, los webhooks disparados tras la entrega de cada estudiante suelen incluir toda la carga institucional:
-1. **Rúbrica repetida 100 veces**: Si un curso tiene 100 estudiantes, la rúbrica completa (criterios, descriptores, ratings) se reenvía 100 veces consecutivas (~1,000 tokens x 100 = 100,000 tokens desperdiciados).
-2. **Logística y reglamentos irrelevantes para el LLM**: El campo `assignment.description` incluye fechas límite, advertencias de formato ("subir antes del domingo en Word", avisos del EVA), indicaciones de entrega que no evalúan el texto y consumen de 300 a 600 tokens por llamada.
-3. **Metadatos administrativos en el Prompt**: Códigos internos de base de datos como `courseId: 79871`, `assignmentId: 992586`, `submissionId: 57423885` y encabezados decorativos (`--- DIRECTIVAS INSTITUCIONALES DEL HUB ---`) que confunden a modelos compactos y aumentan la latencia.
+1. **Payload LMS duplicado**: sin un slot compartido, los datos de tarea y rúbrica pueden viajar otra vez del LMS al HUB para cada estudiante. Precargarlos evita esa repetición en la integración HTTP; no significa que la rúbrica se pueda quitar de cada evaluación del modelo.
+2. **Descripción mezclada con logística**: `assignment.description` puede contener fechas, formato de entrega y avisos del EVA además de la consigna pedagógica. El HUB conserva la descripción común y prepara la consigna evaluable; el administrador debe evitar reenviar el bloque extenso en cada payload.
+3. **Metadatos administrativos**: `courseId`, `assignmentId` y `submissionId` son necesarios para correlación, pero no forman parte de la directiva pedagógica. Mantenerlos en los campos/slots de LMS evita mezclarlos con las instrucciones de evaluación.
 
 ---
 
 ### 15.2. Arquitectura de Separación: Telemetría LMS vs Prompt Evaluativo
 
 El HUB implementa una **arquitectura de doble flujo**:
-- **Flujo de Telemetría y Trazabilidad (Interno):** Almacena de forma persistente todos los metadatos de Canvas (`course_id`, `assignment_id`, `assignment_name`, `submission_id`, `user_id_canvas`, `submission_type`) en el objeto `datos_lms`. Estos datos se utilizan para:
+- **Flujo de Telemetría y Trazabilidad (Interno):** El contexto compartido persiste los datos comunes de Canvas (`course_id`, `assignment_id`, `assignment_name`, `assignment_description`, `rubric`, escala y metadatos permitidos); cada evaluación mantiene sus claves individuales (`submission_id`, `user_id_canvas`, `submission_type`) en el trabajo y resultado. Se utilizan para:
   - Generar el informe en Markdown con cabecera legible.
   - Almacenar el archivo de auditoría JSON en `storage/evaluaciones/`.
   - Construir la respuesta HTTP y el callback para actualizar Canvas SpeedGrader vía API.
-- **Flujo Evaluativo al LLM (Filtrado Inteligente):** **Ninguno** de los metadatos administrativos ni logísticos de Canvas entra en el prompt del LLM.
+- **Flujo Evaluativo al LLM (Filtrado Inteligente):** Los IDs de Canvas y los datos del archivo adjunto no se usan como instrucciones del modelo. La consigna se depura y la rúbrica sí se procesa para cada ensayo, porque los criterios y ratings son necesarios para producir una evaluación válida.
 
 #### Tabla Comparativa: Qué Recibe el HUB vs Qué se Envía al LLM
 
 | Campo del Webhook Canvas | ¿Se Guarda en Telemetría / Reporte? | ¿Se Envía al LLM? | Razón de Optimización |
 | :--- | :---: | :---: | :--- |
-| `assignment.courseId` | **SÍ** | ❌ **NO** | Código numérico administrativo irrelevante para calificar el ensayo. |
-| `assignment.id` | **SÍ** | ❌ **NO** | Identificador interno de Canvas que no aporta valor pedagógico. |
-| `assignment.name` | **SÍ** | ❌ **NO** | Se guarda en `datos_lms.assignment_name` y en el título del reporte final, pero no se inyecta en las directivas del prompt. |
-| `assignment.description` | ❌ **NO** | ❌ **NO** | Contiene logística de entrega en plataforma (fechas, normas de carga); filtrado para ahorrar tokens. |
-| `assignment.rubric` | **SÍ** *(en caché de contexto)* | **SÍ** *(compactado)* | Solo se envían los criterios evaluativos y puntajes. Descriptores duplicados se eliminan automáticamente. |
+| `assignment.courseId` | **SÍ** | ❌ **NO** | Identidad y correlación del contexto compartido. |
+| `assignment.id` | **SÍ** | ❌ **NO** | Identidad de la tarea y correlación. |
+| `assignment.name` | **SÍ** | ❌ **NO** | Trazabilidad y nombre legible del reporte. |
+| `assignment.description` | **SÍ** *(en contexto compartido)* | **PARCIAL** | La consigna evaluable se extrae; logística redundante se omite. |
+| `assignment.rubric` | **SÍ** *(en contexto compartido)* | **SÍ, por evaluación** | Criterios y ratings se requieren para calificar; puede normalizarse y deduplicar texto redundante. |
 | `submission.id` | **SÍ** | ❌ **NO** | ID de entrega para SpeedGrader y almacenamiento de carpetas. |
 | `submission.userId` | **SÍ** | ❌ **NO** | Identificador del estudiante; se usa para nombrar el autor en el reporte sin sesgar al modelo. |
 | `submission.type` | **SÍ** | ❌ **NO** | Telemetría técnica (`online_upload`, `online_text_entry`). |
-| `attachment.url` | **SÍ** | ❌ **NO** | Se descarga en memoria/disco; al LLM solo viaja el texto extraído del documento. |
+| `attachment.url` | Se procesa para obtener el documento | ❌ **NO** | El endpoint/URL no se manda como prompt; el contenido extraído del archivo sí se evalúa. |
 | Contenido del Ensayo | **SÍ** | **SÍ** | Texto académico esencial que debe ser calificado. |
-| Directiva Institucional | **SÍ** | **SÍ** *(1 línea compacta)* | Escala (0 a 10.0), tono pedagógico y directiva institucional UTPL mediante `compact=True`. |
+| Directiva Institucional | **SÍ** | **SÍ** *(compilada por presupuesto)* | Escala, tono y políticas se inyectan usando el compilador de contexto; esto es distinto de la rúbrica de la tarea. |
 
 ---
 
-### 15.3. Directiva Institucional Compacta (`compact=True`)
+### 15.3. Directiva Institucional Compilada por Presupuesto
 
-Al evaluar ensayos, el inyector compila una directiva de alta densidad de una sola línea:
+En la evaluación asíncrona, el HUB compila el contexto institucional con un
+presupuesto de hasta 512 tokens por defecto (`PROMPT_EVAL_CONTEXT_BUDGET`).
+El límite es un máximo, no un objetivo: un contexto pequeño puede compilarse a
+menos tokens. Para el contexto de UTPL usado en dos evaluaciones recientes, el
+estimador heurístico midió 46 tokens compilados frente a 95 tokens para la
+instrucción institucional completa (49 tokens, aproximadamente 51,6% menos por
+evaluación). Es una estimación del bloque institucional, no el conteo real del
+proveedor ni el uso total del prompt.
+
+El texto compilado puede adoptar una forma breve como:
 
 ```text
 [Directiva: UNIVERSIDAD_TECNICA_PARTICULAR_DE_LOJA_UTPL | Escala: 0 a 10.0 | Tono: pedagógico, constructivo y formal]
 ```
 
-En lugar del bloque decorativo estándar con ASCII borders y resúmenes de ranuras, reduciendo el overhead de contexto de ~120 tokens a **menos de 15 tokens**.
+El ahorro del compilador aplica al contexto institucional. No incluye el ensayo
+ni la rúbrica, que siguen siendo necesarios para evaluar cada entrega. Para
+informar consumo/costo real de inferencia, el LMS o la integración del proveedor
+debe registrar los tokens de prompt/completion reportados por el proveedor.
 
 ---
 
@@ -1451,40 +1678,33 @@ El parser `RubricaGenerica` detecta automáticamente si `long_description` es id
 
 ---
 
-### 15.5. Guía de Integración para el Webhook de Canvas (Dos Opciones)
+### 15.5. Integración del Webhook Asíncrono de Canvas
 
-#### Opción 1: Patrón Cero Duplicación con `X-Context-ID` (Recomendado para Máximo Rendimiento)
+`POST /ensayos/webhook-canvas` siempre encola la entrega y responde `202 Accepted`. No espera la descarga/procesamiento del documento ni la inferencia LLM. Guarda el `evaluation_id` recibido y consulta `GET /ensayos/estado/{evaluation_id}` para obtener el resultado.
 
-##### Paso 1: Inicialización del Contexto de la Tarea (1 sola vez por tarea/semestre)
-Un flujo de N8N o el administrador registra la tarea y rúbrica una única vez:
+#### Contexto compartido por institución, curso y tarea
+
+Cuando el evento incluye `institution_id`, `course_id` y `assignment_id`, el HUB deriva un `context_id` estable y persiste el contexto compartido de la tarea: descripción, rúbrica, escala y metadatos permitidos. Las entregas de estudiantes distintos de la misma institución/curso/tarea reutilizan ese contexto. Los datos del alumno y de su entrega se mantienen en cada trabajo de evaluación, no en el contexto común.
+
+El payload Canvas estándar puede incluir `assignment.rubric`, descripción, envío y archivo/texto. La primera solicitud crea o actualiza el contexto; las siguientes completan los datos comunes sin almacenar `user_id_canvas` ni `submission_id` dentro del slot compartido. En evaluación LMS, un `X-Context-ID` explícito no sustituye el identificador derivado de institución/curso/tarea; conserva ese header para los demás endpoints que usan el contexto general.
+
+También se puede preparar el contexto antes del lote mediante `/context/init` y `POST /context/{context_id}/slot/lms`. Esto es opcional para la identidad por curso/tarea, pero permite registrar con anticipación la rúbrica y descripción comunes.
+
+#### Enviar la entrega
 
 ```bash
-curl -X POST http://localhost:10000/context/init \
+curl -i -X POST http://localhost:10000/ensayos/webhook-canvas \
   -H "Content-Type: application/json" \
   -d '{
-    "context_id": "ctx_utpl_curso79871_tarea992586",
     "institution_id": "UNIVERSIDAD_TECNICA_PARTICULAR_DE_LOJA_UTPL",
-    "evaluation_scale": 10.0,
-    "tone_policy": "pedagógico, constructivo y formal",
-    "slots": {
-      "lms": {
-        "course_id": "79871",
-        "assignment_id": "992586",
-        "assignment_name": "Investigación y propuesta: Matriz FODA",
-        "rubric": [ ... rúbrica de Canvas ... ]
-      }
-    }
-  }'
-```
-
-##### Paso 2: Webhooks de Alumnos (Envío Ultraligero)
-Cada vez que un estudiante entrega su trabajo en Canvas, el webhook solo envía la entrega y el archivo adjunto:
-
-```bash
-curl -X POST http://localhost:10000/ensayos/webhook-canvas \
-  -H "Content-Type: application/json" \
-  -H "X-Context-ID: ctx_utpl_curso79871_tarea992586" \
-  -d '{
+    "assignment": {
+      "id": "992586",
+      "courseId": "79871",
+      "name": "Investigación y propuesta: Matriz FODA",
+      "description": "Analice la situación de la empresa...",
+      "pointsPossible": 10,
+      "rubric": [ ... rúbrica de Canvas ... ]
+    },
     "submission": {
       "id": "57423885",
       "userId": "182199",
@@ -1497,70 +1717,549 @@ curl -X POST http://localhost:10000/ensayos/webhook-canvas \
   }'
 ```
 
-> [!TIP]
-> **Payload de solo ~250 bytes:** El webhook no transporta la rúbrica ni textos repetidos. El HUB descarga el archivo, extrae el texto, asocia la rúbrica almacenada en el contexto, y evalúa el trabajo en segundos.
-
----
-
-#### Opción 2: Webhook Tradicional de Canvas (Compatibilidad Transparente)
-
-Si tu sistema emite el payload estándar de Canvas con todos los bloques (`assignment`, `submission`, `attachment` y `ai`):
-
-- **No necesitas cambiar nada en Canvas:** Envía el JSON tal como sale de Canvas a `POST /ensayos/webhook-canvas` o `POST /ensayos/evaluar-flujo-completo`.
-- **Auto-Caché:** En la primera entrega, el HUB almacena automáticamente la rúbrica en el contexto.
-- **Filtrado Automático:** El motor extrae los metadatos para `datos_lms` y filtra la logística de la tarea para que el LLM reciba únicamente el ensayo y los criterios esenciales.
-
----
-
-### 15.6. Formato de Respuesta para SpeedGrader de Canvas
-
-La respuesta HTTP incluye los objetos requeridos para sincronización inmediata con Canvas:
+La respuesta inmediata confirma recepción y trae la correlación necesaria para consultar el trabajo; aún no contiene nota ni feedback:
 
 ```json
 {
-  "pipeline": "completado",
-  "status": "success",
+  "status": "ENCOLADO",
+  "estado": "PENDING",
+  "evaluation_id": "eval_...",
+  "context_id": "ctx_lms_...",
+  "institution_id": "UNIVERSIDAD_TECNICA_PARTICULAR_DE_LOJA_UTPL",
+  "course_id": "79871",
+  "assignment_id": "992586",
+  "user_id_canvas": "182199",
+  "submission_id": "57423885"
+}
+```
+
+El identificador es opaco para el cliente: úsalo exactamente como fue devuelto, sin construirlo desde el `submission_id`.
+
+#### Consultar el estado
+
+```bash
+curl http://localhost:10000/ensayos/estado/eval_...
+```
+
+- `PENDING` o `EVALUATING`: el worker aún está procesando; vuelve a consultar con una espera apropiada.
+- `EVALUATED`: la respuesta incluye el resultado canónico con calificación, feedback y `rubric_assessment_canvas`.
+- `ERROR`: incluye el motivo en `error`.
+- `NOT_FOUND`: el identificador no existe (HTTP `404`).
+
+El mismo contrato asíncrono está disponible para payloads directos en `POST /ensayos/enqueue`. `POST /ensayos/evaluar-flujo-completo` continúa siendo síncrono y solo se recomienda cuando el cliente realmente necesita esperar el resultado durante esa petición.
+
+### 15.6. Resultado Final para SpeedGrader de Canvas
+
+Cuando `GET /ensayos/estado/{evaluation_id}` devuelve `EVALUATED`, la respuesta canónica incluye, entre otros, estos campos. Esta es la respuesta que debe usarse para sincronizar la calificación con Canvas; no el acuse `202` inicial.
+
+```json
+{
+  "status": "EVALUADO",
+  "evaluation_id": "eval_...",
+  "context_id": "ctx_lms_...",
+  "submission_id": "57423885",
+  "course_id": "79871",
+  "assignment_id": "992586",
+  "user_id_canvas": "182199",
   "modelo_utilizado": "google/gemma-3-27b-it:free",
   "nota_final": 9.0,
   "escala_maxima": 10.0,
+  "feedback": "El estudiante demostró un sólido dominio al contextualizar la institución...",
   "rubric_assessment_canvas": {
     "_2541": {
       "points": 2.5,
       "rating_id": "blank",
       "comments": "La contextualización incluye datos completos y bien organizados..."
-    },
-    "_9637": {
-      "points": 2.5,
-      "rating_id": "_4544",
-      "comments": "El análisis presenta las cuatro categorías del FODA..."
-    },
-    "_901": {
-      "points": 2.0,
-      "rating_id": "_3467",
-      "comments": "El plan incluye objetivos claros..."
-    },
-    "_5229": {
-      "points": 2.0,
-      "rating_id": "_4357",
-      "comments": "La propuesta ofrece ideas interesantes..."
     }
   },
   "datos_lms": {
     "id_lms": "CANVAS",
     "course_id": "79871",
     "assignment_id": "992586",
-    "assignment_name": "Investigación y propuesta: Matriz FODA",
     "user_id_canvas": "182199",
     "submission_id": "57423885",
     "submission_type": "online_upload"
-  },
-  "ai": {
-    "score": 9.0,
-    "feedback": "El estudiante demostró un sólido dominio al contextualizar la institución...",
-    "result": { ... },
-    "status": "COMPLETED"
   }
 }
 ```
 
 
+---
+
+## 16. Guía de Integración para el Administrador del LMS
+
+Esta sección define el contrato REST que debe implementar el LMS (o su
+integrador) para enviar entregas en segundo plano, consultar su avance y
+recuperar el resultado. El flujo está pensado para procesar muchos estudiantes
+que comparten una misma institución, curso y tarea.
+
+### 16.1. Preparación y creación del contexto
+
+Hay dos niveles de contexto y no deben confundirse:
+
+1. **Contexto institucional general (opcional):** se crea con
+   `POST /context/init`. Sirve para herramientas que reciben un `X-Context-ID`
+   y para establecer políticas, tono, escala y directivas generales. La
+   respuesta incluye el `context_id` y el TTL de sesión. Chat y otros contextos
+   generales vencen conforme a ese TTL (una hora por defecto).
+2. **Contexto compartido de evaluación por institución + curso + tarea:** al
+   precargar el slot `lms` con `course_id` y `assignment_id`, `/context/init`
+   crea una actividad durable con identidad estable. También se crea al recibir
+   la primera evaluación completa con estos tres identificadores. El contexto
+   permanece activo hasta que el LMS cierre la tarea mediante
+   `POST /context/{context_id}/close`; desde entonces se conserva por el plazo
+   de gracia (tres días por defecto).
+
+Para el flujo de ensayos, el LMS **no debe crear un contexto por estudiante**.
+Puede precargar los datos comunes de la tarea en el slot `lms` una sola vez por
+institución/curso/tarea y reutilizar el `context_id` en las entregas. Al incluir
+`slots.lms.course_id` y `slots.lms.assignment_id` en `/context/init`, el HUB
+deriva el mismo identificador estable que utilizará la evaluación; el LMS no
+debe calcularlo. Como alternativa, envíe la tarea completa en la primera
+evaluación y reutilice el `context_id` devuelto por el HUB en las siguientes.
+
+Ejemplo opcional de contexto institucional general:
+
+```bash
+curl -i -X POST http://localhost:10000/context/init \
+  -H "Content-Type: application/json" \
+  -d '{
+    "institution_id": "UNIVERSIDAD_TECNICA_PARTICULAR_DE_LOJA_UTPL",
+    "tenant_id": "FACULTAD_DE_ADMINISTRACION",
+    "system_source": "CANVAS_LMS",
+    "user_role": "DOCENTE",
+    "evaluation_scale": 10,
+    "tone_policy": "pedagógico, constructivo y formal",
+    "global_policy": "Evaluar con criterios académicos y retroalimentación formativa.",
+    "ttl_seconds": 3600
+  }'
+```
+
+Respuesta ilustrativa `200 OK`:
+
+```json
+{
+  "status": "success",
+  "context_id": "ctx_...",
+  "expires_in_seconds": 3600,
+  "institution_id": "UNIVERSIDAD_TECNICA_PARTICULAR_DE_LOJA_UTPL"
+}
+```
+
+El LMS debe guardar ese identificador y enviarlo como `X-Context-ID` al usar el
+slot LMS precargado. En el primer envío de evaluación completa, debe guardar el
+`context_id` recibido en el acuse `202`.
+
+#### Precarga recomendada del slot `lms` para un lote
+
+El slot `lms` permite registrar una vez los datos que son iguales para todos
+los estudiantes: identidad de curso y tarea, consigna, escala y rúbrica. Para
+el ejemplo real de Canvas, la identidad es institución UTPL + curso `79871` +
+tarea `992586`. No incluir en este slot información individual como
+`submission.id`, `submission.userId`, texto del estudiante, comentarios de
+SpeedGrader ni URLs privadas de adjuntos.
+
+Se puede crear y precargar el contexto en una llamada:
+
+```bash
+curl -i -X POST http://localhost:10000/context/init \
+  -H "Content-Type: application/json" \
+  -d '{
+    "institution_id": "UNIVERSIDAD_TECNICA_PARTICULAR_DE_LOJA_UTPL",
+    "tenant_id": "GENERAL",
+    "system_source": "CANVAS_LMS",
+    "user_role": "DOCENTE",
+    "evaluation_scale": 10,
+    "tone_policy": "pedagógico, constructivo y formal",
+    "context_grace_days": 3,
+    "slots": {
+      "lms": {
+        "course_id": "79871",
+        "assignment_id": "992586",
+        "assignment_name": "[APEB1-30%] Investigación y propuesta: Analice la situación actual de una empresa utilizando la matriz FODA y proponga un plan de mejora en base a los resultados del análisis",
+        "assignment_description": "Analice la situación actual de una empresa utilizando la matriz FODA y proponga un plan de mejora. Incluya la descripción de la organización, cuatro elementos por cada dimensión FODA y un plan con al menos dos objetivos, dos estrategias por objetivo, actividades, responsables e indicadores.",
+        "scale": 10,
+        "rubric": [
+          {
+            "id": "_2541",
+            "points": 2.5,
+            "description": "Contextualización de la institución",
+            "ratings": [
+              { "id": "blank", "points": 2.5, "description": "Excelente", "long_description": "Descripción clara, completa y bien organizada." },
+              { "id": "_5282", "points": 2, "description": "Muy bueno", "long_description": "Descripción adecuada, aunque falta algún detalle menor." },
+              { "id": "_9978", "points": 1.25, "description": "Bueno", "long_description": "Información incompleta o poco clara." },
+              { "id": "blank_2", "points": 0.5, "description": "Regular", "long_description": "Información muy escasa o desorganizada." }
+            ]
+          },
+          {
+            "id": "_9637",
+            "points": 2.5,
+            "description": "Análisis FODA",
+            "ratings": [
+              { "id": "_4544", "points": 2.5, "description": "Excelente", "long_description": "Presenta cuatro elementos bien redactados y coherentes por cada categoría." },
+              { "id": "_1696", "points": 2, "description": "Muy bueno", "long_description": "Presenta al menos tres elementos por categoría, con coherencia." },
+              { "id": "_2278", "points": 1.25, "description": "Bueno", "long_description": "Presenta menos de tres elementos en alguna categoría o hay poca claridad." },
+              { "id": "_933", "points": 0.5, "description": "Regular", "long_description": "Análisis incompleto, poco reflexivo o confuso." }
+            ]
+          },
+          {
+            "id": "_901",
+            "points": 2.5,
+            "description": "Plan de mejora",
+            "ratings": [
+              { "id": "_4127", "points": 2.5, "description": "Excelente", "long_description": "Objetivos, estrategias y actividades bien definidas, viables y alineadas al FODA." },
+              { "id": "_3467", "points": 2, "description": "Muy bueno", "long_description": "Plan adecuado, aunque algunas partes podrían desarrollarse mejor." },
+              { "id": "_3078", "points": 1.25, "description": "Bueno", "long_description": "Plan poco detallado o con poca relación con el diagnóstico." },
+              { "id": "_1569", "points": 0.5, "description": "Regular", "long_description": "Plan incompleto, sin coherencia ni aplicabilidad." }
+            ]
+          },
+          {
+            "id": "_5229",
+            "points": 2.5,
+            "description": "Pertinencia de la propuesta",
+            "ratings": [
+              { "id": "_4177", "points": 2.5, "description": "Excelente", "long_description": "Propuesta innovadora, adaptada a la realidad de la organización y con ideas originales." },
+              { "id": "_4357", "points": 2, "description": "Muy bueno", "long_description": "Propuesta adecuada, con algunas ideas interesantes." },
+              { "id": "_7751", "points": 1.25, "description": "Bueno", "long_description": "Propuesta poco novedosa o poco adaptada al contexto." },
+              { "id": "_7520", "points": 0.5, "description": "Regular", "long_description": "Propuesta sin creatividad ni relación con la realidad institucional." }
+            ]
+          }
+        ]
+      }
+    }
+  }'
+```
+
+La respuesta incluye `context_id`, `lifecycle_type` y `grace_period_days`.
+Guarde el ID y envíelo como header `X-Context-ID` en las peticiones de
+evaluación. Personalice el período por actividad con `context_grace_days` entre
+0 y 365; si se omite, se aplica `LMS_CONTEXT_GRACE_DAYS` (default 3). También
+se puede inicializar el slot con solo `course_id` y `assignment_id` y completar
+los demás datos comunes antes del primer envío mediante
+`POST /context/{context_id}/slot/lms`, enviando `{ "data": { ...campos lms... } }`.
+Esos dos identificadores deben estar presentes desde `/context/init` para que
+el contexto tenga identidad estable y ciclo de vida de actividad; crear primero
+una sesión genérica y añadirlos después no la convierte en actividad LMS.
+
+El slot usa estos nombres canónicos:
+
+| Campo de `slots.lms` | Equivalencia Canvas | Uso |
+|---|---|---|
+| `course_id` | `assignment.courseId` | Parte de la identidad compartida. |
+| `assignment_id` | `assignment.id` | Parte de la identidad compartida. |
+| `assignment_name` | `assignment.name` | Nombre legible para trazabilidad. |
+| `assignment_description` | `assignment.description` | Consigna común; se conserva para las evaluaciones. |
+| `rubric` | `assignment.rubric` | Criterios y ratings necesarios para calificar. |
+| `scale` | `assignment.pointsPossible` | Escala de Canvas; en el ejemplo es 10. |
+
+La petición Canvas de ejemplo incluye también `submission.comments` y el bloque
+`ai`. Son datos de estado/retroalimentación previa de Canvas, no son necesarios
+para iniciar una evaluación nueva: omítalos del payload al HUB, salvo que una
+integración tenga un caso funcional explícito que los requiera.
+
+#### Cierre de tarea y período de gracia
+
+Cuando el LMS cierre la actividad, el LMS o su integrador debe invocar:
+
+```bash
+curl -i -X POST http://localhost:10000/context/ctx_lms_<identificador estable>/close \
+  -H "Content-Type: application/json" \
+  -d '{ "context_grace_days": 3 }'
+```
+
+Si se omite `context_grace_days`, se aplica `LMS_CONTEXT_GRACE_DAYS`. El plazo
+empieza cuando se registra el cierre; no se calcula automáticamente desde
+`due_at` o `lock_at`. Durante la gracia el contexto se puede restaurar para
+finalizar trabajos encolados y hacer reintentos/consultas. Al vencer, el
+contexto deja de ser restaurable; los trabajos que lo referencien fallarán con
+HTTP `410` en vez de recrear silenciosamente otro contexto. Para entregas
+posteriores, el LMS debe volver a inicializar la tarea con los datos comunes.
+
+El HUB permite reabrir una actividad con `POST /context/init` y el mismo slot;
+se reactiva el identificador estable. Los datos del slot no se pueden modificar
+mientras la actividad esté cerrada; primero hay que reabrirla. Los contextos
+generales de chat y otras sesiones no usan este endpoint y siguen su TTL
+(`ttl_seconds`, una hora por defecto).
+
+Configura `DB_DSN` con un backend durable. Si la persistencia de contextos LMS
+no está disponible, la evaluación falla con `503` y no se acepta como durable.
+Protege las operaciones de inicialización, actualización, cierre y eliminación
+con autenticación/autorización en el gateway o integración del LMS.
+
+### 16.2. Enviar una entrega para evaluación
+
+El LMS envía una petición por entrega a
+`POST /ensayos/webhook-canvas`. La respuesta `202 Accepted` significa que el
+trabajo fue aceptado en la cola, **no** que ya tenga calificación.
+
+Campos principales:
+
+| Campo | Obligatorio para este flujo | Uso |
+|---|---:|---|
+| `institution_id` | Recomendado | Identifica la institución y participa en la identidad del contexto compartido. Puede omitirse en llamadas posteriores si el `X-Context-ID` ya la contiene. |
+| `assignment.id` | Sí, salvo que esté precargado en el slot | Identificador de la tarea. Se recomienda repetirlo: ocupa poco y facilita validar la correlación. |
+| `assignment.courseId` o `assignment.course_id` | Sí, salvo que esté precargado en el slot | Identificador del curso. Se recomienda repetirlo por la misma razón. |
+| `assignment.name` | No si está precargado | Nombre legible de la actividad para trazabilidad. |
+| `assignment.description` | No si está precargada | Consigna común; evita reenviar la descripción extensa en cada estudiante. |
+| `assignment.pointsPossible` o `points_possible` | Recomendado | Escala máxima. Es un dato pequeño que puede repetirse en cada entrega. |
+| `assignment.rubric` | Sí, salvo que esté precargada en `slots.lms.rubric` | Rúbrica Canvas completa, necesaria para evaluar. No eliminar ratings ni descriptores pedagógicos. |
+| `submission.id` | Sí | Identificador de la entrega; se devuelve como correlación. |
+| `submission.userId` | Sí | Identificador del estudiante para asociar el resultado en el LMS. |
+| `submission.type` | Recomendado | Tipo de entrega Canvas, por ejemplo `online_upload` o `online_text_entry`. |
+| `attachment.url` | Para entrega por archivo | URL que el HUB pueda descargar desde su servidor. |
+| `attachment.txt` o `submission.body` | Alternativa a URL | Texto de la entrega ya disponible para enviar. |
+
+Ejemplo completo con archivo adjunto y rúbrica:
+
+```bash
+curl -i -X POST http://localhost:10000/ensayos/webhook-canvas \
+  -H "Content-Type: application/json" \
+  -d '{
+    "institution_id": "UNIVERSIDAD_TECNICA_PARTICULAR_DE_LOJA_UTPL",
+    "assignment": {
+      "id": "992586",
+      "courseId": "79871",
+      "name": "Ensayo: análisis estratégico",
+      "description": "Analice la estrategia de una organización y justifique sus conclusiones con fuentes académicas.",
+      "pointsPossible": 10,
+      "rubric": [
+        {
+          "id": "_2541",
+          "points": 5,
+          "description": "Análisis y argumentación",
+          "ratings": [
+            { "id": "_r1", "points": 5, "description": "Argumentación completa y sustentada" },
+            { "id": "_r2", "points": 3, "description": "Argumentación parcial" },
+            { "id": "_r3", "points": 0, "description": "No presenta argumentación" }
+          ]
+        },
+        {
+          "id": "_2542",
+          "points": 5,
+          "description": "Uso de fuentes académicas",
+          "ratings": [
+            { "id": "_r4", "points": 5, "description": "Fuentes pertinentes, integradas y citadas" },
+            { "id": "_r5", "points": 3, "description": "Uso limitado o irregular de fuentes" },
+            { "id": "_r6", "points": 0, "description": "No utiliza fuentes" }
+          ]
+        }
+      ]
+    },
+    "submission": {
+      "id": "57423885",
+      "userId": "182199",
+      "type": "online_upload"
+    },
+    "attachment": {
+      "name": "ensayo-estudiante.docx",
+      "contentType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "url": "https://lms.example.edu/files/123/download?token=URL_TEMPORAL"
+    },
+    "proveedor_llm": "modelo"
+  }'
+```
+
+Para `online_text_entry`, se puede omitir `attachment.url` y enviar el contenido
+en `submission.body` (o en `attachment.txt`). Si el LMS manda la rúbrica fuera
+del bloque `assignment`, puede usar `origen_rubrica`. El identificador de
+institución, curso y tarea debe conservarse igual en todas las entregas de ese
+grupo. El `submission.id` y `submission.userId` sí cambian según el estudiante
+y la entrega.
+
+#### Payload mínimo por estudiante cuando el slot `lms` está precargado
+
+Envía el `context_id` de `POST /context/init` en `X-Context-ID`. El middleware
+activa el contexto antes de validar el body; el HUB recupera del slot `lms` la
+rúbrica, la descripción, el nombre y, si falta, los identificadores de curso y
+tarea. Conserva en el body las claves de entrega, el texto/archivo del
+estudiante y los IDs ligeros de curso/tarea para que el LMS y el HUB puedan
+comprobar la correlación:
+
+```bash
+curl -i -X POST http://localhost:10000/ensayos/webhook-canvas \
+  -H "Content-Type: application/json" \
+  -H "X-Context-ID: ctx_preparado_para_el_lote" \
+  -d '{
+    "institution_id": "UNIVERSIDAD_TECNICA_PARTICULAR_DE_LOJA_UTPL",
+    "assignment": {
+      "id": "992586",
+      "courseId": "79871",
+      "pointsPossible": "10.00"
+    },
+    "submission": {
+      "id": "57423860",
+      "userId": "181093",
+      "type": "online_text_entry"
+    },
+    "attachment": {
+      "contentType": "text/html",
+      "txt": "Texto completo entregado por este estudiante..."
+    },
+    "proveedor_llm": "modelo"
+  }'
+```
+
+En el ejemplo, el body ya no repite el título largo, la descripción completa,
+los cuatro criterios ni sus 16 ratings. El `submission.id`, `submission.userId`
+y el contenido de la entrega sí son propios de cada estudiante y se envían en
+cada trabajo. Para una entrega de archivo, reemplaza `attachment.txt` por
+`attachment.name`, `contentType` y `url` descargable por el HUB.
+
+Usa el `context_id` devuelto por `/context/init` en el primer envío del lote.
+El acuse `202` de esa primera evaluación devolverá el contexto de evaluación
+persistido para institución/curso/tarea; almacénalo y úsalo como
+`X-Context-ID` para los envíos posteriores del mismo grupo. No cruces ese ID
+entre cursos, tareas o instituciones. Si no se precargó el slot, envía la
+descripción y rúbrica en la primera evaluación; a partir del `context_id`
+devuelto, las siguientes solicitudes pueden usar el payload reducido anterior.
+
+El slot evita repetir datos comunes **en la integración LMS → HUB** y permite
+reutilizar la identidad/contexto de la tarea. No elimina la rúbrica del trabajo
+evaluativo: el modelo necesita los criterios para calificar cada ensayo. El
+compilador reduce el bloque de contexto institucional; no debe anunciarse el
+tamaño de la rúbrica como ahorro de tokens de inferencia, porque se procesa en
+cada evaluación.
+
+El servidor debe poder descargar `attachment.url` sin depender de cookies o
+sesión interactiva del navegador. Si la URL requiere autenticación que el HUB no
+tiene, el integrador debe entregar el texto extraído por un canal admitido (por
+ejemplo `attachment.txt`/`submission.body`) o configurar un mecanismo de acceso
+servidor a servidor. No se deben registrar URLs firmadas ni tokens de descarga
+en logs del LMS.
+
+### 16.3. Guardar el acuse y asociar el trabajo
+
+Respuesta ilustrativa `202 Accepted`:
+
+```json
+{
+  "status": "ENCOLADO",
+  "estado": "PENDING",
+  "evaluation_id": "eval_57423885",
+  "context_id": "ctx_lms_...",
+  "institution_id": "UNIVERSIDAD_TECNICA_PARTICULAR_DE_LOJA_UTPL",
+  "course_id": "79871",
+  "assignment_id": "992586",
+  "user_id_canvas": "182199",
+  "submission_id": "57423885"
+}
+```
+
+El LMS debe persistir como mínimo:
+
+- `evaluation_id`: clave para consultar el estado.
+- `submission_id`, `user_id_canvas`, `course_id` y `assignment_id`: claves para
+  correlacionar el resultado con la entrega y el libro de calificaciones.
+- `context_id`: referencia de auditoría al contexto compartido.
+- Fecha de recepción y último estado consultado.
+
+No se debe construir el `evaluation_id` en el LMS ni asumir que una respuesta
+`202` contiene la evaluación. En reintentos de envío con el mismo ID de entrega,
+el HUB puede devolver el mismo trabajo si ya está pendiente, procesándose o
+evaluado; el LMS debe conservar el `evaluation_id` devuelto y evitar crear
+registros duplicados.
+
+### 16.4. Consultar el estado y recolectar el resultado
+
+El endpoint de consulta es:
+
+```text
+GET /ensayos/estado/{evaluation_id}
+```
+
+Ejemplo:
+
+```bash
+curl -i http://localhost:10000/ensayos/estado/eval_57423885 \
+  -H "Accept: application/json"
+```
+
+Interpretación de respuesta:
+
+| HTTP / `estado` o `status` | Significado | Acción del LMS |
+|---|---|---|
+| `200`, `PENDING` | Aceptada; aún no tomada por el worker. | Esperar y consultar de nuevo. |
+| `200`, `EVALUATING` | El worker está procesando la entrega. | Esperar y consultar de nuevo. |
+| `200`, `EVALUATED` o resultado con `status: EVALUADO` | Resultado disponible. | Persistirlo y sincronizar nota/feedback/rúbrica con el LMS. |
+| `200`, `ERROR` | El proceso terminó con error. | Registrar `error` y activar el mecanismo de recuperación/soporte del LMS. |
+| `404`, `NOT_FOUND` | El HUB no encuentra ese ID en su backend actual. | Verificar el ID, la URL/instancia consultada y si el trabajo fue encolado; no tratarlo como “sigue procesando”. |
+
+Ejemplo de respuesta mientras espera:
+
+```json
+{
+  "evaluation_id": "eval_57423885",
+  "estado": "EVALUATING",
+  "context_id": "ctx_lms_...",
+  "submission_id": "57423885",
+  "course_id": "79871",
+  "assignment_id": "992586",
+  "user_id_canvas": "182199"
+}
+```
+
+El cliente debe hacer polling con espera entre consultas y un plazo máximo
+configurable; no debe consultar en un bucle inmediato. Como valor inicial, puede
+esperar 3–5 segundos y aplicar backoff progresivo (por ejemplo, hasta 15–30
+segundos) mientras el estado sea `PENDING` o `EVALUATING`. El tiempo total
+depende de la descarga del archivo y del proveedor/modelo LLM, no solo del
+intervalo interno del worker.
+
+Cuando termina, el mismo GET devuelve el resultado canónico, por ejemplo:
+
+```json
+{
+  "status": "EVALUADO",
+  "evaluation_id": "eval_57423885",
+  "context_id": "ctx_lms_...",
+  "submission_id": "57423885",
+  "course_id": "79871",
+  "assignment_id": "992586",
+  "user_id_canvas": "182199",
+  "nota_final": 8.5,
+  "escala_maxima": 10,
+  "feedback": "La argumentación es clara; se recomienda integrar mejor las fuentes.",
+  "rubric_assessment_canvas": {
+    "_2541": {
+      "points": 4,
+      "rating_id": "_r2",
+      "comments": "La argumentación es pertinente, aunque algunos puntos requieren mayor sustento."
+    },
+    "_2542": {
+      "points": 4.5,
+      "rating_id": "_r4",
+      "comments": "Las fuentes son pertinentes; falta uniformidad en las citas."
+    }
+  },
+  "datos_lms": {
+    "id_lms": "CANVAS",
+    "course_id": "79871",
+    "assignment_id": "992586",
+    "user_id_canvas": "182199",
+    "submission_id": "57423885",
+    "submission_type": "online_upload"
+  }
+}
+```
+
+Para Canvas, el LMS usa `nota_final`, `feedback` y
+`rubric_assessment_canvas` al actualizar SpeedGrader mediante la API de Canvas.
+Debe verificar que el `submission_id`, `user_id_canvas`, `course_id` y
+`assignment_id` del resultado coincidan con la entrega local antes de aplicar
+una nota. El callback `webhook_lms_url`, si se usa, no reemplaza el GET de
+estado como fuente canónica descrita por este contrato.
+
+### 16.5. Alcance de la consulta de cola
+
+El GET documentado consulta **un trabajo por `evaluation_id`**. No existe en
+este contrato un endpoint `GET` para listar/buscar todos los trabajos de la
+cola, filtrar por curso o descargar un lote de estados. Si el panel del LMS
+necesita una vista de seguimiento, debe mantener su propio registro de los
+`evaluation_id` recibidos y consultar cada uno, o acordar la incorporación de
+un endpoint administrativo específico.
+
+La cola es asíncrona y el worker procesa un trabajo a la vez por instancia. El
+LMS no debe mantener abierta la petición de envío hasta completar la inferencia:
+debe guardar el acuse `202`, continuar su flujo y recolectar el resultado con
+GET. La documentación interactiva de la instancia (`/docs`) y su contrato
+OpenAPI (`/openapi.json`) permiten verificar rutas y esquemas publicados.

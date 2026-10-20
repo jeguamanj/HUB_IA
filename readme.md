@@ -66,11 +66,26 @@ uv sync
 
 ## ▶️ Ejecutar el Servidor
 
+Para desarrollo local se conserva el modo heredado con `HUB_API_TOKEN`. Para
+staging o producción usa `API_CLIENT_AUTH_ENABLED=true` y credenciales
+individuales por integración; consulta [INSTRUCCIONES_USO_API.md](INSTRUCCIONES_USO_API.md)
+para emitirlas, consultar metadatos y gestionar su expiración, rotación y
+revocación.
+
+Configura `HUB_API_TOKEN` para las operaciones de API y `HUB_DOCS_USERNAME` /
+`HUB_DOCS_PASSWORD` para abrir `/docs`, `/redoc` y `/openapi.json`. Swagger
+solicita autenticación HTTP Basic para cargar la documentación y, por separado,
+el Bearer token para ejecutar operaciones. Solo `GET /health` queda público.
+Si faltan credenciales, los recursos correspondientes responden `503`.
+`GET /ready` también es público y solo informa disponibilidad tras completar
+el arranque.
+
 ```powershell
 uv run uvicorn API.server:app --port 10000 --reload
 ```
 
 - **URL Base:** `http://localhost:10000`
+- **Healthcheck público:** `http://localhost:10000/health`
 - **Documentación Swagger UI:** `http://localhost:10000/docs`
 - **Documentación Redoc:** `http://localhost:10000/redoc`
 
@@ -81,14 +96,17 @@ uv run uvicorn API.server:app --port 10000 --reload
 | Prefijo | Módulo | Descripción |
 | :--- | :--- | :--- |
 | `/context` | Contexto Institucional | Registro, consulta y enriquecimiento por ranuras de sesiones institucionales (`/init`, `/{id}`, `/{id}/slot/{slot}`). |
-| `/echo` | Echo | Verificación rápida de disponibilidad. |
+| `/health` | Health | Healthcheck público mínimo para balanceadores y monitoreo. |
+| `/echo` | Echo | Servicio de eco de prueba (requiere Bearer token). |
 | `/llm` | Chat LLM & Modelos | Chat con inyección de contexto (`/chat`), diagnóstico Ollama (`/ollama/status`, `/ollama/models`) y catálogo de modelos free (`/models/free`). |
 | `/api` | Zoom Reports | Generación y exportación de reportes Excel (`/zoom/report/excel`). |
 | `/zoom/manage` | Zoom Management | Configuración de sesiones, hosts alternativos y panelistas. |
 | `/zoom/licenses` | Zoom Licenses | Evaluación y auditoría de licencias Zoom. |
-| `/ensayos` | Evaluador Ensayos | Flujo completo de evaluación con rúbricas, contexto institucional e integración Canvas LMS. |
+| `/ensayos` | Evaluador Ensayos | Evaluación síncrona (`/evaluar-flujo-completo`) y flujo asíncrono LMS (`/webhook-canvas`, `/enqueue`, `/estado/{evaluation_id}`) con rúbricas y contexto institucional. |
 
 Consulta [INSTRUCCIONES_USO_API.md](INSTRUCCIONES_USO_API.md) para ver ejemplos detallados de payloads y respuestas de cada endpoint.
+
+Consulta [PLAN_HUB.md](PLAN_HUB.md) para revisar los pendientes y las etapas de seguridad y gestión de contexto LLM, y [DEPLOYMENT_PRODUCTION.md](DEPLOYMENT_PRODUCTION.md) para la preparación de Azure y Ubuntu. Los runbooks no autorizan por sí mismos un despliegue.
 
 ---
 
@@ -120,5 +138,102 @@ Para convertir el HUB en el **Core de IA Institucional**, el sistema desacopla e
 1. **Ahorro de Tokens:** Se registra el contexto una sola vez (`POST /context/init`) y se reutiliza mediante el header HTTP `X-Context-ID: ctx_abc123`, ahorrando millones de tokens en flujos de N8N o llamadas repetitivas.
 2. **Equidad de Contexto:** Cualquier herramienta MCP invocada (Chat, Evaluador de Ensayos, Zoom, o futuras integraciones) consulta `get_current_context()`, aplicando automáticamente la misma política ética, escala evaluativa y tono pedagógico.
 3. **Escalabilidad por Ranuras:** Arquitectura modular por slots (`lms`, `zoom`, `crm`, `custom`), permitiendo incorporar nuevas herramientas MCP sin alterar el modelo global ni realizar migraciones de datos.
-4. **Filtrado Anti-Desperdicio de Tokens en Webhooks:** Al procesar webhooks de Canvas LMS o Moodle, el HUB separa la telemetría administrativa (`courseId`, `submissionId`, `userId`, logística de entrega) de la directiva evaluativa. El LLM recibe exclusivamente el ensayo, la rúbrica y una directiva compacta de una línea (`compact=True`), evitando inyectar metadatos superfluos al modelo.
+4. **Filtrado Anti-Desperdicio de Tokens en Webhooks:** Al procesar webhooks de Canvas LMS, el HUB separa la telemetría administrativa (`courseId`, `submissionId`, `userId`, logística de entrega) de la directiva evaluativa. El LLM recibe el ensayo, la rúbrica y una directiva institucional comprimida al presupuesto de tokens configurado, evitando inyectar metadatos superfluos al modelo.
 
+### Evaluación masiva desde Canvas
+
+`POST /ensayos/webhook-canvas` encola cada entrega y responde `202 Accepted` con `evaluation_id`,
+`context_id` y datos de correlación. El LMS consulta `GET /ensayos/estado/{evaluation_id}` hasta
+recibir el resultado o un estado de error; no debe esperar la calificación en la respuesta del webhook.
+
+El contexto común de una tarea se identifica de forma estable por institución, curso y assignment, y
+persiste descripción, rúbrica, escala y metadatos compartidos en la base configurada. Por tanto, todos
+los alumnos de la misma tarea reutilizan el contexto, mientras `user_id_canvas` y `submission_id`
+siguen asociados a cada job individual. Para persistencia durable en SQLite/PostgreSQL, instalar el
+extra de base de datos (`uv sync --extra db`) y configurar `DB_DSN`. `DATABASE_URL`
+se admite como alias heredado únicamente si `DB_DSN` no está definida; si ambas
+están definidas, prevalece `DB_DSN`. Un valor vacío deja los backends en memoria
+y no proporciona durabilidad.
+
+Para pruebas de integración con PostgreSQL, usa una base aislada `hub_test` y un
+rol dedicado que no sea superusuario. Ejecuta como administrador de PostgreSQL:
+
+```sql
+CREATE ROLE hub_test_user LOGIN PASSWORD 'replace_with_a_local_secret';
+CREATE DATABASE hub_test OWNER hub_test_user ENCODING 'UTF8';
+```
+
+Configura en `.env` local (sin subirlo al repositorio) un DSN SQLAlchemy async:
+
+```dotenv
+DB_DSN=postgresql+asyncpg://hub_test_user:URL_ENCODED_PASSWORD@localhost:5432/hub_test
+```
+
+En desarrollo, el `lifespan` aplica migraciones pendientes al iniciar. En
+producción, ejecuta antes `python -m API.core.postgres_migrations apply` en un
+paso administrativo con `MIGRATION_DB_DSN` (rol DDL); el proceso de API usa
+`DB_DSN` con un rol runtime sin permisos DDL y solo verifica que el esquema esté
+al día. Si faltan migraciones, producción no inicia. No guardes ambas
+credenciales en el entorno runtime de la API.
+Si la contraseña contiene caracteres reservados de URL, deben codificarse.
+Mantén PostgreSQL de pruebas separado de cualquier base con datos reales.
+
+Para `APP_ENV=production`, configura `API_CLIENT_AUTH_ENABLED=true`,
+`HUB_DOCS_USERNAME`, `HUB_DOCS_PASSWORD` (mínimo 16 caracteres),
+`DB_DSN=postgresql+asyncpg://...` y
+`ATTACHMENT_ALLOWED_HOSTS` con los dominios del LMS/CDN separados por coma.
+El arranque falla si falta alguno. `/health` informa liveness y `/ready` solo
+queda listo después de inicializar la cola. Los tokens individuales tienen
+scopes por institución; Zoom privado/MCP pasa a fase 2. Para el PMV on-prem se
+incluyen plantillas de systemd y Nginx con TLS, bind local y límite de
+peticiones; deben parametrizarse para el servidor y dominio reales antes de
+instalarlas. Consulta [DEPLOYMENT_PRODUCTION.md](DEPLOYMENT_PRODUCTION.md).
+
+### Migraciones de evaluaciones PostgreSQL
+
+En desarrollo, con `DB_DSN` apuntando a una base PostgreSQL, el `lifespan`
+aplica automáticamente los scripts numerados pendientes en orden. Para
+producción, aplica primero las migraciones con `MIGRATION_DB_DSN` mediante
+`python -m API.core.postgres_migrations apply`; no arranques el proceso de API
+con el rol DDL. Los comandos `psql` siguientes son una alternativa manual para
+desarrollo o pruebas:
+
+```powershell
+psql -h localhost -p 5433 -U hub_test_user -d hub_test -v ON_ERROR_STOP=1 -f migrations\001_initial_evaluation_persistence.sql
+psql -h localhost -p 5433 -U hub_test_user -d hub_test -v ON_ERROR_STOP=1 -f migrations\002_rename_evaluation_submission_groups.sql
+psql -h localhost -p 5433 -U hub_test_user -d hub_test -v ON_ERROR_STOP=1 -f migrations\003_api_client_tokens.sql
+psql -h localhost -p 5433 -U hub_test_user -d hub_test -v ON_ERROR_STOP=1 -f migrations\004_production_runtime_tables.sql
+```
+
+Para el despliegue, prefiere el comando del runner con el DSN de migración
+inyectado desde el entorno seguro, no desde un argumento ni en el historial
+interactivo:
+
+```powershell
+python -m API.core.postgres_migrations apply
+```
+
+La migración `002` renombra el contador de intentos a
+`evaluation_submission_groups` para reservar `submission_groups` al tracker
+existente. No vuelvas a ejecutar migraciones ya aplicadas; consulta su registro:
+
+```sql
+SELECT version, name, checksum, applied_at
+FROM hub_schema_migrations
+ORDER BY version;
+```
+
+La descripción de las siete tablas, sus relaciones, columnas y consideraciones
+operativas está en [migrations/README.md](migrations/README.md).
+
+El flujo asíncrono del evaluador escribe en `evaluation_jobs`, reserva y consume
+intentos en `evaluation_submission_groups`, registra eventos e intentos técnicos,
+recupera leases vencidos y persiste telemetría LLM/MCP sin prompts ni argumentos.
+`/ensayos/estado/{evaluation_id}` lee ese job. La ruta síncrona y el tracker
+legado todavía no comparten la misma transacción. El runner omite migraciones ya
+registradas por versión, pero aún no valida checksums; resolver la discrepancia
+conocida de `001` antes de automatizar producción.
+
+El proveedor OpenAI usa `OPENAI_API_KEY`, `OPENAI_ENDPOINT` y `OPENAI_MODEL`.
+Los reportes Zoom conservan rutas y formato Excel, comparten OAuth/helpers y
+ejecutan handlers síncronos en el threadpool. Artemis queda fuera del PMV actual.

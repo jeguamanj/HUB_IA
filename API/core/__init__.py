@@ -10,6 +10,7 @@ from API.core.context_engine import (
     compile_system_prompt,
     estimate_tokens,
     SystemPrompt,
+    CompiledContext,
     COMPACT_TOKEN_BUDGET,
     FULL_TOKEN_BUDGET,
 )
@@ -31,6 +32,25 @@ from API.core.schemas import (
     validate_slot_data,
     ensure_schema,
 )
+from API.core.token_estimator import (
+    TokenEstimate,
+    estimate_tokens,
+    estimate_tokens_tiktoken,
+    estimate_tokens_heuristic,
+    estimate_prompt_tokens,
+    estimate_message_list_tokens,
+    check_token_budget,
+    detect_language,
+)
+from API.core.context_compressor import compress_context
+from API.core.prompt_compiler import (
+    compile_context_prompt,
+    estimate_context_prompt,
+    build_budget_report,
+    ContextBudgetReport,
+    hash_prompt,
+    DEFAULT_SYSTEM_TOKEN_BUDGET,
+)
 
 __all__ = [
     "InstitutionalContext",
@@ -43,6 +63,7 @@ __all__ = [
     "compile_system_prompt",
     "estimate_tokens",
     "SystemPrompt",
+    "CompiledContext",
     "COMPACT_TOKEN_BUDGET",
     "FULL_TOKEN_BUDGET",
     "ContextBackend",
@@ -59,4 +80,18 @@ __all__ = [
     "migrate_slot_data",
     "validate_slot_data",
     "ensure_schema",
+    "TokenEstimate",
+    "estimate_tokens_tiktoken",
+    "estimate_tokens_heuristic",
+    "estimate_prompt_tokens",
+    "estimate_message_list_tokens",
+    "check_token_budget",
+    "detect_language",
+    "compress_context",
+    "compile_context_prompt",
+    "estimate_context_prompt",
+    "build_budget_report",
+    "ContextBudgetReport",
+    "hash_prompt",
+    "DEFAULT_SYSTEM_TOKEN_BUDGET",
 ]

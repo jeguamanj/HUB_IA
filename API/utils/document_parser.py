@@ -1,13 +1,58 @@
 # API/utils/document_parser.py
 
 import os
+import asyncio
+import ipaddress
 import io
 import re
 import base64
+import socket
+from urllib.parse import urljoin, urlsplit
 from typing import Dict, Any, Optional, Tuple
 import httpx
 from pypdf import PdfReader
 import docx
+
+MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
+MAX_DOWNLOAD_REDIRECTS = 5
+
+
+async def _validate_download_url(url: str) -> str:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("La URL de descarga debe usar HTTP o HTTPS")
+    if parsed.username or parsed.password:
+        raise ValueError("No se permiten credenciales embebidas en la URL")
+
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(".local"):
+        raise ValueError("No se permiten destinos locales")
+
+    allowed_hosts = {
+        host.strip().lower().lstrip(".")
+        for host in os.getenv("ATTACHMENT_ALLOWED_HOSTS", "").split(",")
+        if host.strip()
+    }
+    if allowed_hosts and not any(
+        hostname == allowed or hostname.endswith(f".{allowed}")
+        for allowed in allowed_hosts
+    ):
+        raise ValueError("El host de descarga no está permitido")
+    if os.getenv("APP_ENV", "").strip().lower() in {"prod", "production"} and not allowed_hosts:
+        raise ValueError("ATTACHMENT_ALLOWED_HOSTS debe configurarse en producción")
+
+    try:
+        literal_ip = ipaddress.ip_address(hostname)
+        addresses = [literal_ip]
+    except ValueError:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        records = await asyncio.to_thread(
+            socket.getaddrinfo, hostname, port, 0, socket.SOCK_STREAM
+        )
+        addresses = [ipaddress.ip_address(record[4][0]) for record in records]
+    if not addresses or any(not address.is_global for address in addresses):
+        raise ValueError("No se permiten destinos de red privados o reservados")
+    return hostname
 
 
 async def fetch_url_bytes(url: str, timeout: float = 30.0) -> Tuple[bytes, str]:
@@ -15,12 +60,44 @@ async def fetch_url_bytes(url: str, timeout: float = 30.0) -> Tuple[bytes, str]:
     Descarga el contenido binario desde una URL remota.
     Retorna los bytes y el nombre/tipo sugerido en los headers.
     """
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-        
-        content_type = response.headers.get("content-type", "").lower()
-        content_disposition = response.headers.get("content-disposition", "")
+    current_url = url
+    async with httpx.AsyncClient(
+        follow_redirects=False, timeout=timeout, trust_env=False
+    ) as client:
+        for redirect_count in range(MAX_DOWNLOAD_REDIRECTS + 1):
+            await _validate_download_url(current_url)
+            async with client.stream("GET", current_url) as response:
+                if 300 <= response.status_code < 400:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise ValueError("La redirección de descarga no incluye destino")
+                    if redirect_count == MAX_DOWNLOAD_REDIRECTS:
+                        raise ValueError("Se excedió el máximo de redirecciones de descarga")
+                    next_url = urljoin(current_url, location)
+                    if (
+                        urlsplit(current_url).scheme == "https"
+                        and urlsplit(next_url).scheme != "https"
+                    ):
+                        raise ValueError("No se permiten redirecciones HTTPS a HTTP")
+                    current_url = next_url
+                    continue
+                response.raise_for_status()
+                content_length = response.headers.get("content-length")
+                if content_length and int(content_length) > MAX_DOWNLOAD_BYTES:
+                    raise ValueError("El archivo excede el máximo de 25 MB")
+                chunks = []
+                size = 0
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > MAX_DOWNLOAD_BYTES:
+                        raise ValueError("El archivo excede el máximo de 25 MB")
+                    chunks.append(chunk)
+
+                content_type = response.headers.get("content-type", "").lower()
+                content_disposition = response.headers.get("content-disposition", "")
+                break
+        else:
+            raise ValueError("No se pudo completar la descarga")
         
         # Intentar extraer nombre de archivo si viene en Content-Disposition
         filename = ""
@@ -29,7 +106,7 @@ async def fetch_url_bytes(url: str, timeout: float = 30.0) -> Tuple[bytes, str]:
             if match:
                 filename = match.group(1)
                 
-        return response.content, filename or content_type
+        return b"".join(chunks), filename or content_type
 
 
 def detect_file_type(data: bytes, hint: str = "") -> str:
@@ -169,6 +246,8 @@ async def parse_document_input(source: str, hint: str = "") -> Dict[str, Any]:
 
         # 2. Caso: Archivo local en disco
         elif os.path.exists(source_clean) and os.path.isfile(source_clean):
+            if os.getenv("APP_ENV", "").strip().lower() in {"prod", "production"}:
+                raise ValueError("Las rutas locales no están habilitadas en producción")
             source_type = "file"
             with open(source_clean, "rb") as f:
                 raw_bytes = f.read()

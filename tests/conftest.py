@@ -40,6 +40,12 @@ def clear_network_env(monkeypatch):
         "ZOOM_CLIENT_SECRET",
         "CANVAS_API_URL",
         "CANVAS_API_TOKEN",
+        "HUB_API_TOKEN",
+        "API_CLIENT_AUTH_ENABLED",
+        "HUB_DOCS_USERNAME",
+        "HUB_DOCS_PASSWORD",
+        "DB_DSN",
+        "DATABASE_URL",
     ):
         monkeypatch.delenv(key, raising=False)
     yield

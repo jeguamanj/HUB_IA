@@ -8,6 +8,7 @@
 #   - Trazabilidad LMS (course/assignment/submission/user).
 # =============================================================================
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -21,6 +22,8 @@ from API.services.essay_evaluator_mcp import (
     SolicitudEvaluacionDirecta,
     _extraer_consigna_evaluable,
 )
+from API.utils import document_parser
+from API.utils.document_parser import _validate_download_url
 
 DESC_REAL = (
     "Descripción de la actividad\n\nComponente de aprendizaje:\n\n"
@@ -138,3 +141,113 @@ class TestEnvelopeIntento:
         }
         req = SolicitudEvaluacionDirecta.model_validate(payload)
         assert req.max_intentos == 3
+
+
+class TestAttachmentUrlSecurity:
+    def test_blocks_loopback_addresses(self):
+        with pytest.raises(ValueError, match="privados o reservados"):
+            asyncio.run(_validate_download_url("http://127.0.0.1/internal"))
+
+    def test_production_allowlist_rejects_unapproved_host(self, monkeypatch):
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("ATTACHMENT_ALLOWED_HOSTS", "lms.example.edu")
+
+        with pytest.raises(ValueError, match="no está permitido"):
+            asyncio.run(_validate_download_url("https://evil.example.net/file.docx"))
+
+    def test_fetch_follows_validated_canvas_redirect(self, monkeypatch):
+        calls = []
+
+        class Response:
+            def __init__(self, status_code, headers, body=b""):
+                self.status_code = status_code
+                self.headers = headers
+                self.body = body
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_bytes(self):
+                yield self.body
+
+        class Client:
+            def __init__(self, **kwargs):
+                assert kwargs["follow_redirects"] is False
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def stream(self, method, url):
+                calls.append(url)
+                if len(calls) == 1:
+                    return Response(
+                        302,
+                        {"location": "https://files.canvas.example/download?sig=secret"},
+                    )
+                return Response(
+                    200,
+                    {"content-type": "application/pdf", "content-length": "4"},
+                    b"%PDF",
+                )
+
+        validated = []
+
+        async def validate(url):
+            validated.append(url)
+            return "canvas.example"
+
+        monkeypatch.setattr(document_parser, "_validate_download_url", validate)
+        monkeypatch.setattr(document_parser.httpx, "AsyncClient", Client)
+
+        data, hint = asyncio.run(
+            document_parser.fetch_url_bytes("https://canvas.example/files/1")
+        )
+
+        assert data == b"%PDF"
+        assert hint == "application/pdf"
+        assert validated == calls
+        assert len(calls) == 2
+
+    def test_fetch_rejects_redirect_to_http_from_https(self, monkeypatch):
+        class Response:
+            status_code = 302
+            headers = {"location": "http://files.example/download"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_value, traceback):
+                return False
+
+        class Client:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def stream(self, method, url):
+                return Response()
+
+        async def validate(url):
+            return "example"
+
+        monkeypatch.setattr(document_parser, "_validate_download_url", validate)
+        monkeypatch.setattr(document_parser.httpx, "AsyncClient", Client)
+
+        with pytest.raises(ValueError, match="HTTPS a HTTP"):
+            asyncio.run(
+                document_parser.fetch_url_bytes("https://canvas.example/files/1")
+            )

@@ -36,7 +36,7 @@ que quieres formar:
 ┌───────────────▼───────────────────────────────────────────────────────┐
 │                     2. CONTEXT FABRIC (Telar de Contexto)             │
 │   API/core/context_engine.py                                          │
-│   InstitutionalContext · ContextStore (TTL) · contextvars ·           │
+│   InstitutionalContext · ContextStore (TTL sesión / ciclo LMS) ·      │
 │   to_system_instruction(compact=True) · slots{lms,zoom,crm,custom}    │
 └───────────────▲───────────────────────────────────────────────────────┘
                 │  get_current_context() → inyección transparente al LLM
@@ -102,30 +102,113 @@ MCP_HUB_SERVER_IA/
 ### 4.1. Inyección de Contexto Institucional (el corazón)
 ```text
 Cliente → POST /context/init → { context_id: "ctx_abc123" }
-Cliente → POST /ensayos/evaluar-flujo-completo
+Cliente → POST /llm/chat (o herramienta que propaga contexto)
            header: X-Context-ID: ctx_abc123
                 │
                 ▼  InstitutionalContextMiddleware (context_engine)
-                ▼  context_store.get(ctx_id) → set _current_context_var
-                ▼  essay_evaluator_mcp → get_current_context()
-                ▼  _construir_prompt_evaluacion() → ctx.to_system_instruction(compact=True)
-                ▼  LLM recibe directiva compacta + ensayo + rúbrica (sin metadatos)
+                ▼  await context_store.get_or_restore(ctx_id) → set _current_context_var
+                ▼  servicio → get_current_context() → directiva institucional
 ```
 - **Modo 1:** `X-Context-ID` (reutilización, máximo ahorro).
 - **Modo 2:** headers efímeros `X-Institution-ID` / `X-Tenant-ID` / `X-User-Role` (TTL 5 min).
 - **Modo 3:** integración N8N (init → reusar → enriquecer slot → delete/expira).
 
-### 4.2. Pipeline de Evaluación de Ensayos (3 tools MCP)
+**Excepción para evaluaciones LMS:** los endpoints de ensayo resuelven y persisten un contexto
+compartido por `(institution_id, course_id, assignment_id)`. En el modo asíncrono, el job lleva
+`context_id` y el worker restaura ese contexto antes de ejecutar el pipeline. El ID compartido se
+devuelve en la respuesta inicial del webhook para correlación. Los contextos `session` expiran por
+`ttl_seconds`; los contextos LMS (`activity`) permanecen activos hasta el cierre explícito vía
+`POST /context/{context_id}/close` y se retienen durante `LMS_CONTEXT_GRACE_DAYS` (3 días por
+defecto, configurable por actividad). La persistencia durable es obligatoria para aceptar
+evaluaciones LMS; sin backend durable la API responde `503`.
+
+### 4.2. Pipeline de Evaluación de Ensayos (detallado)
+La evaluación de ensayos es el flujo núcleo del HUB. El endpoint directo conserva el modo **síncrono**;
+el webhook Canvas y el endpoint `/enqueue` usan el modo **asíncrono** y comparten el mismo pipeline interno.
+
+#### 4.2.1. Diagrama general (ambos modos)
 ```text
-evaluar-flujo-completo
-  ├─ 0. Sincroniza/crea InstitutionalContext (persiste rúbrica en slot lms)
-  ├─ 1. obtener_ensayos()     → parse_document_input() (URL/local/Base64/texto)
-  ├─ 2. evaluar_con_rubrica() → _construir_prompt_evaluacion() → LLM → parseo JSON defensivo
-  └─ 3. guardar_reporte()     → storage/evaluaciones/{id}/reporte_{json,md} + notificación webhook
+                         ┌──────────────── ENTRADA ────────────────┐
+   Sync  POST /ensayos/evaluar-flujo-completo  (espera la respuesta)
+   Async POST /ensayos/webhook-canvas          (202 inmediato)
+   Async POST /ensayos/enqueue                 (202 inmediato)      │
+                     └──────────────┬───────────────┘
+                                    ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │ 1. CONTROL DE ENVÍOS  (submission_tracker)              │
+        │    check_allowed(course, assignment, user)              │
+        │    - ¿máx intentos alcanzado?  ──►  HTTP 429 LÍMITE     │
+        └───────────────────────┬─────────────────────────────────┘
+                                ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │ 2. CONTEXTO INSTITUCIONAL (context_engine)             │
+        │    - Identidad por institución + curso + tarea         │
+        │    - LMS compartido: descripción, rúbrica y escala      │
+        │    - Alumno/entrega permanecen en cada trabajo          │
+        └───────────────────────┬─────────────────────────────────┘
+                                ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │ 3. COMPILADOR DE DIRECTIVA (B1.3 prompt_compiler)      │
+        │    to_system_instruction(budget_tokens, language)       │
+        │    - Estima tokens + comprime → SIEMPRE ≤ PROMPT_EVAL.. │
+        └───────────────────────┬─────────────────────────────────┘
+                                ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │ 4. EXTRACCIÓN DE DOCUMENTOS (document_parser)          │
+        │    obtener_ensayos():                                   │
+        │      - URL (descarga DOCX/PDF) → texto                 │
+        │      - Base64 → texto                                   │
+        │      - Texto plano → directo                            │
+        │    + consigna (assignment.description) depurada         │
+        └───────────────────────┬─────────────────────────────────┘
+                                ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │ 5. EVALUACIÓN CON LLM (evaluar_con_rubrica)            │
+        │    prompt = directiva + consigna + rúbrica + ensayo     │
+        │    → motor LLM (modelo/free con Hedged Racing)          │
+        │    → parsea JSON estructurado (criterios + evidencias)  │
+        └───────────────────────┬─────────────────────────────────┘
+                                ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │ 6. PERSISTENCIA / RESPUESTA                             │
+        │    - construir canon (status EVALUADO, nota, feedback,  │
+        │      rubric_assessment_canvas)                           │
+        │    - guardar storage/evaluaciones/{id}/reporte_{json,md}│
+        │    - registrar intento (submission_tracker.register)    │
+        │    Sync: devolver HTTP 200 con canon                    │
+        │    Async: marcar evaluation_jobs = EVALUATED            │
+        └─────────────────────────────────────────────────────────┘
 ```
-- Acepta payload nativo Canvas (`assignment`/`submission`/`attachment`), formato directo (`origen_ensayo`/`origen_rubrica`),
-  o **Patrón Cero Duplicación** (rúbrica solo en el contexto + webhook ultraligero).
-- Genera `rubric_assessment_canvas` listo para la API REST de Canvas (SpeedGrader).
+
+#### 4.2.2. Detalle de cada etapa
+
+| # | Etapa | Módulo | Acción clave | Salida |
+|---|---|---|---|---|
+| 0 | **Entrada** | `essay_evaluator_mcp.py` | Acepta payload nativo Canvas/LTI (`assignment`+`submission`+`attachment`) o formato directo (`origen_ensayo`/`origen_rubrica`). | `SolicitudEvaluacionDirecta` validada |
+| 1 | **Control de envíos** | `core/submission_tracker.py` | `check_allowed()` por `(course_id, assignment_id, user_id)`. Límite `MAX_SUBMISSION_ATTEMPTS` (default 2; sobrescribible por `max_intentos` en payload). | Permiso + registro de crónica |
+| 2 | **Contexto institucional** | `core/context_engine.py` | Resuelve `InstitutionalContext` (X-Context-ID / efímero). Aplica directivas, escala, políticas. | dict `model_dump` con slots |
+| 3 | **Compilador de directiva** | `core/prompt_compiler.py` | `to_system_instruction(budget_tokens, language)`: estima y comprime; **garantiza no exceder** `PROMPT_EVAL_CONTEXT_BUDGET`. | bloque de texto de directiva |
+| 4 | **Extracción de documentos** | `utils/document_parser.py` | `obtener_ensayos()`: URL/Base64/texto + consigna `assignment.description` depurada (`_extraer_consigna_evaluable`). | `texto_ensayo`, `texto_rubrica`, etc. |
+| 5 | **Evaluación LLM** | `essay_evaluator_mcp.py` | Construye prompt con directiva+consigna+rúbrica+ensayo → LLM → parseo JSON defensivo → `EvaluacionResultado`. | criterios con justificación + evidencias |
+| 6 | **Persistencia / respuesta** | `essay_evaluator_mcp.py` | Construye canon (`status EVALUADO`, `rubric_assessment_canvas`), guarda en `storage/`, registra intento, devuelve respuesta (sync) o marca `evaluation_jobs=EVALUATED` (async). | canon JSON + reporte en disco |
+
+#### 4.2.3. Modos de entrada
+
+| Modo | Endpoint | Respuesta inmediata | Cuándo | Persistencia |
+|---|---|---|---|---|
+| **Síncrono** | `POST /ensayos/evaluar-flujo-completo` | HTTP 200 con canon completo al terminar el LLM | Bajo volumen / trazabilidad inmediata | `storage/evaluaciones/{id}/` |
+| **Asíncrono Canvas** ✅ | `POST /ensayos/webhook-canvas` → `GET /ensayos/estado/{id}` | 202 `PENDING` al instante; worker procesa 1-a-la-vez | Webhooks y envíos masivos | `evaluation_jobs` (SQLite/Postgres) |
+| **Asíncrono directo** | `POST /ensayos/enqueue` → `GET /ensayos/estado/{id}` | 202 `PENDING` al instante; worker procesa 1-a-la-vez | Otros LMS / alto volumen | `evaluation_jobs` (SQLite/Postgres) |
+
+> **Recomendado para producción y lotes Canvas**: el webhook encola, responde `202` con `evaluation_id`
+> y correlación (contexto, institución, curso, tarea, estudiante y entrega), y el LMS consulta el estado
+> hasta `EVALUATED`. El worker procesa fuera de la petición HTTP.
+
+#### 4.2.4. Ahorro de tokens en este flujo
+- **Directiva comprimida por presupuesto** (`PROMPT_EVAL_CONTEXT_BUDGET`): deja de ser `compact=True` binario.
+- **Consigna depurada**: `_extraer_consigna_evaluable()` recorta la plantilla EVA a la parte sustantiva.
+- **Rúbrica compactada**: se omiten `long_description` duplicados.
+- **Campos críticos priorizados** por `context_compressor` si el contexto es masivo.
 
 ### 4.3. Motor LLM de Conmutación Ultrarrápida (Hedged Racing)
 ```text
@@ -146,11 +229,13 @@ evaluar-flujo-completo
 
 | Ruta | Servicio | Métodos |
 | :--- | :--- | :--- |
-| `/context` | context_service | `/init`, `/{id}`, `/{id}/slot/{slot}`, `/active/current`, `DELETE /{id}` |
+| `/context` | context_service | `/init`, `/{id}`, `/{id}/slot/{slot}`, `/{id}/close`, `/active/current`, `DELETE /{id}` |
 | `/llm/chat` | llm_chat_service | POST chat con fallback |
 | `/llm/models/free`, `/llm/models/refresh` | llm_chat_service | GET/POST catálogo dinámico |
 | `/llm/ollama/status`, `/llm/ollama/models` | llm_chat_service | GET diagnóstico on-premise |
-| `/ensayos/evaluar-flujo-completo`, `/ensayos/webhook-canvas` | essay_evaluator_mcp | POST pipeline completo |
+| `/ensayos/evaluar-flujo-completo` | essay_evaluator_mcp | POST pipeline síncrono |
+| `/ensayos/webhook-canvas`, `/ensayos/enqueue` | essay_evaluator_mcp | POST encolado asíncrono (202) |
+| `/ensayos/estado/{evaluation_id}` | essay_evaluator_mcp | GET estado o resultado canónico |
 | `/api/zoom/report/check`, `/api/zoom/report/excel` | zoom_reports | POST check y generación Excel |
 | `/zoom/manage/*` | zoom_management_service | PATCH/POST/DELETE/GET sesiones y panelistas |
 | `/zoom/licenses/*` | zoom_license_management | GET evaluate/scan/report/csv, POST downgrade |
@@ -166,7 +251,7 @@ evaluar-flujo-completo
 | 1 | `openai.py` | Es un **stub** ("respuesta ficticia") — no llama a OpenAI real | Implementar cliente real o eliminarlo del catálogo |
 | 2 | `zoom_reports.py` | ~1500 líneas, lógica duplicada con `zoom_api_utils.py`, funciones referenciadas pero indefinidas (`get_participants_with_pagination`, `create_*_sheet` comparten helpers con managers), `raise HTTPException` dentro de `except` de `requests` | Refactorizar en módulos: `zoom_client`, `excel_builder`, `recurrence_service` |
 | 3 | Auto-Corrección de JSON LLM | Parseo JSON defensivo con regex (frágil ante modelos nuevos) | Migrar a `response_format`/structured outputs de OpenRouter o validación con Pydantic + reintento |
-| 4 | Persistencia | ContextStore es **in-memory** (se pierde en restart; "Redis-ready" declarado pero no implementado) | Implementar backend Redis/TTL real o SQLite para durable sessions |
+| 4 | Persistencia | ContextStore y cola de evaluaciones usan backends durables SQLAlchemy (SQLite/Postgres); sin configuración/driver disponible pueden degradar a memoria transitoria | Configurar `DATABASE_URL`/`DB_DSN`, instalar `uv sync --extra db` y monitorizar logs de degradación |
 | 5 | Configuración duplicada | Zoom credenciales en `config.py` y en `zoom_api_utils.py`/`zoom_reports.py` por separado | Centralizar en `config.py` + `get_settings()` |
 | 6 | Errores `requests` | `zoom_*` usan `requests` síncrono (bloquea el event-loop de FastAPI) | Migrar a `httpx.AsyncClient` (como ya hace `modelo.py`/`document_parser.py`) |
 | 7 | `.env` sin esquema | No hay `.env.example` / validación de credenciales obligatorias | Crear `.env.example` + validación en boot de `config.py` |
@@ -214,7 +299,7 @@ FASE 0  (A-lote)  FUNDACIÓN CORE
 | ID | Agente | Misión | Archivos de trabajo | Estado |
 | :--- | :--- | :--- | :--- | :--- |
 | A0.1 | `boot-settings` | Centralizar la configuración en un módulo único (`get_settings()`), crear `.env.example`, validar credenciales obligatorias al arrancar con mensajes claros | `API/config.py`, `API/server.py`, `.env.example` | ✅ **implementado** (v1) |
-| A0.2 | `tests-harness` | Parametrizar `pyproject.toml` (pytest dev-group), crear `tests/` y un *baseline* con mocks (sin llamadas reales a OpenRouter/Zoom) | `pyproject.toml`, `pytest.ini`, `tests/` (conftest, config test) | 🔶 **en curso (infra lista; pytest pendiente de instalar)** |
+| A0.2 | `tests-harness` | Parametrizar `pyproject.toml` (pytest dev-group), crear `tests/` y un *baseline* con mocks (sin llamadas reales a OpenRouter/Zoom) | `pyproject.toml`, `pytest.ini`, `tests/` (conftest, config test) | ✅ **implementado y verificado** — suite completa en verde en `.venv` (2026-10-20) |
 | A0.3 | `log-config` | Estandarizar logging (nivel, formato, contexto) y reemplazar los `print()` de depuración dispersos por `logger` | `API/core/logging.py` (nuevo), `API/config.py`, `API/server.py`, `modelo.py`, `artemis_adapter.py`, `essay_evaluator_mcp.py`, `zoom_management_service.py` | ✅ **implementado** (v1) — `zoom_reports.py` diferido a C2.4 |
 
 **GATE 0 (se cierra la fase):** servidor arranca limpio, `.env.example` documentado, suite `pytest` en verde y logs estandarizados. A partir de aquí cualquier cambio se puede verificar con la suite.
@@ -235,10 +320,10 @@ FASE 0  (A-lote)  FUNDACIÓN CORE
 | ID | Agente | Misión | Archivos de trabajo | Criterios de aceptación (gate 1) |
 | :--- | :--- | :--- | :--- | :--- |
 | B1.1 | `context-contract` | Esquemas Pydantic **versionados** por slot (`lms`, `zoom`, `crm`, `custom`) + `schema_version` en `InstitutionalContext` + migración forward-compatible que conserva campos desconocidos | `API/core/schemas.py` (nuevo), `API/core/context_engine.py`, `API/core/__init__.py` | ✅ **implementado (v1)** — Slots validados por tipo; contextos sin versión cargan sin romperse (default `SCHEMA_VERSION`); campos futuros nunca se pierden (extra="allow"); `set_slot`/`migrate_all_slots` no destructivos |
-| B1.2 | `durable-store` | Backend de persistencia del `ContextStore` con TTL — **SQLite (default) y PostgreSQL**, conmutables vía `DB_DSN` (SQLAlchemy async) y **fallback a memoria con aviso** si el driver/base no está disponible | `API/core/context_backend.py` (nuevo), `API/core/context_engine.py`, `API/config.py`, `.env.example` | ✅ **implementado (v1)** — Contexto sobrevive restart (test); TTL respetado; interfaz de `context_store` intacta (write-through best-effort) |
+| B1.2 | `durable-store` | Backend de persistencia del `ContextStore` — **SQLite (default) y PostgreSQL**, conmutables vía `DB_DSN` (SQLAlchemy async); TTL para sesiones y ciclo de actividad LMS con gracia; fallback a memoria con aviso para sesiones si el driver/base no está disponible | `API/core/context_backend.py` (nuevo), `API/core/context_engine.py`, `API/config.py`, `.env.example` | ✅ **implementado** — Contexto sobrevive restart (test); TTL de sesión y retención LMS aplicados; la evaluación LMS exige backend configurado |
 | B1.3 | `prompt-compiler` | Compilador de system prompt con **presupuesto de tokens medible** por modo y garantía de **no filtrado de metadatos LMS** en modo compact | `API/core/context_engine.py` (`compile_system_prompt`, `SystemPrompt`, `estimate_tokens`), `tests/` | ✅ **implementado (v1)** — compact ≤ `PROMPT_COMPACT_BUDGET` (64); full ≤ `PROMPT_FULL_BUDGET` (256); `estimate_tokens`; sin fuga de course_id/assignment_id/account_id en compact (test) |
 
-**GATE 1 (se cierra la fase):** ~~contexto con esquemas versionados, persistencia durable (TTL) y compilador de prompts con presupuesto de tokens testeado~~ — **✅ GATE 1 CERRADO** (B1.1 `context-contract`, B1.2 `durable-store`, B1.3 `prompt-compiler` implementados y verificados). Las nuevas herramientas MCP podrán reutilizar un contexto fiable y durable.
+**GATE 1 (se cierra la fase):** ~~contexto con esquemas versionados, persistencia durable (TTL de sesión / ciclo de actividad) y compilador de prompts con presupuesto de tokens testeado~~ — **✅ GATE 1 CERRADO** (B1.1 `context-contract`, B1.2 `durable-store`, B1.3 `prompt-compiler` implementados y verificados). Las nuevas herramientas MCP podrán reutilizar un contexto fiable y durable.
 
 > **Nota B1.2 (durable-store):** la persistencia usa **SQLAlchemy 2.x async**. SQLite y PostgreSQL comparten interfaz; conmutar solo cambia `DB_DSN` en `.env`:
 > ```ini
@@ -372,22 +457,28 @@ FASE 0  (A-lote)  FUNDACIÓN CORE
 
 ```text
 LMS ──POST /ensayos/enqueue──▶ 202 {estado:PENDING, evaluation_id}  (¡inmediato!)
+Canvas ──POST /ensayos/webhook-canvas──▶ 202 {evaluation_id, context_id, correlación}
 LMS ──GET  /ensayos/estado/{id}──▶ PENDING/EVALUATING  (reintenta)
 worker (1 a la vez) procesa en background  ──▶ EVALUATED
 LMS ──GET  /ensayos/estado/{id}──▶ EVALUATED {nota, feedback, rubric_assessment_canvas}
 ```
 
-- **`POST /ensayos/enqueue`**: guarda la solicitud en BD (`evaluation_jobs`) como `PENDING`
-  y devuelve **202** al instante con `evaluation_id` (= `eval_<submission_id>`).
+- **`POST /ensayos/webhook-canvas`**: normaliza el payload de Canvas, prepara/persiste el contexto
+  compartido de la tarea y encola sin ejecutar el LLM dentro de la petición. Devuelve **202** con
+  `status: ENCOLADO`, `estado: PENDING`, `evaluation_id`, `context_id` e IDs de correlación.
+- **`POST /ensayos/enqueue`**: encola payloads directos con el mismo contrato `202`.
+- El `context_id` se deriva de forma determinista de `(institution_id, course_id, assignment_id)`.
+  El contexto común conserva descripción, rúbrica, escala y metadatos permitidos; no contiene el
+  `user_id_canvas` ni el `submission_id`. Cada trabajo mantiene estos identificadores individualmente.
 - **`GET /ensayos/estado/{evaluation_id}`**: `PENDING`/`EVALUATING` → aún no; `EVALUATED` →
-  devuelve el **resultado canónico consolidado**; `ERROR` → motivo; 404 si no existe.
+  devuelve el resultado canónico; `ERROR` → motivo; 404 si no existe. El cliente trata el ID como opaco.
 - **Worker**: bucle asíncrono (1 evaluación a la vez) en el lifespan del servidor; saca el
-  primer `PENDING`, lo pasa a `EVALUATING`, ejecuta el pipeline (descarga + LLM) y lo marca
-  `EVALUATED`/`ERROR`. Controla el rate-limit de OpenRouter (429) y evita saturación.
+  primer `PENDING`, lo pasa a `EVALUATING`, restaura el contexto durable indicado en el payload,
+  establece el contexto aislado para el pipeline (descarga + LLM) y lo marca `EVALUATED`/`ERROR`.
 - **Persistencia**: backend SQLAlchemy async (`evaluation_jobs`) con degradación a memoria
   (sin driver). Reintré de un `submission_id` ya `EVALUATED` no duplica: devuelve el resultado.
-- **Endpoint síncrono** (`/ensayos/evaluar-flujo-completo`) se conserva (retro-compat), pero su
-  salida ahora incluye `respuesta_consolidada` (canónica, sin duplicar).
+- **Endpoint síncrono** (`/ensayos/evaluar-flujo-completo`) se conserva para clientes que necesitan
+  esperar la evaluación en la misma petición. El webhook Canvas no usa esta ruta síncrona.
 
 ### 7.6.2c. Salida consolidada (sin duplicados)
 - Nueva función `_consolidar_resultado()` produce un **JSON canónico único**:
@@ -401,6 +492,33 @@ LMS ──GET  /ensayos/estado/{id}──▶ EVALUATED {nota, feedback, rubric_a
   se inflaba; ahora `rubric_assessment_canvas` (nativo Canvas) es la única vía de criterios
   hacia el LMS, y `evaluacion` queda para auditoría.
 - **Reducción real**: una sola llamada al LLM, sin re-empaquetar el mismo bloque en 4 sitios.
+
+### 7.6.2d. Integración del compilador de prompts en los flujos (B1.3)
+El compilador avanzado (`token_estimator` + `context_compressor` + `prompt_compiler`) ya está
+**integrado en los dos flujos reales** donde se inyecta el contexto institucional:
+
+| Flujo | Archivo | Antes | Ahora | Presupuesto configurable |
+|---|---|---|---|---|
+| **Evaluación de ensayos** | `services/essay_evaluator_mcp.py` · `_construir_prompt_evaluacion()` | `to_system_instruction(compact=True)` (binario) | `to_system_instruction(budget_tokens=..., language=...)` | `PROMPT_EVAL_CONTEXT_BUDGET` (default **512**) |
+| **Chat LLM** | `services/llm_chat_service.py` · `/llm/chat` | `to_system_instruction()` (full, sin tope) | `to_system_instruction(budget_tokens=..., language=...)` | `PROMPT_CHAT_CONTEXT_BUDGET` (default **1024**) |
+
+**Configuración por institución** (12-factor, vía `Settings` / `.env`):
+
+```ini
+PROMPT_EVAL_CONTEXT_BUDGET=512    # tokens de la directiva en evaluación de ensayos
+PROMPT_CHAT_CONTEXT_BUDGET=1024   # tokens de la directiva en chat general
+PROMPT_CONTEXT_LANGUAGE=es        # hint de idioma para la heurística ('' = auto)
+```
+
+**Ventajas aplicadas en producción:**
+- **Garantía de no desborde**: el bloque de contexto institucional NUNCA excede el presupuesto
+  (compresión determinista, incluso con `global_policy` de varios párrafos).
+- **Granularidad real**: deja de ser un interruptor binario (`compact=True/False`) y pasa a
+  un **tope medible de tokens** objeto de configuración institucional.
+- **Ahorro verificado**: con política masiva, el bloque pasa de ~450 a ~56 tokens si se reduce
+  el presupuesto a 200; con tope 512 se mantiene ~495 (rica pero acotada).
+- **Retro-compatible**: el modo `compact=True/False` legacy sigue funcionando (llamadas sin
+  `budget_tokens` no cambian). La clave `language` es opcional (auto-detección por defecto).
 
 ### 7.6.3. Modo CANON B implementado · Opción C (multi-LMS) DOCUMENTADA
 
@@ -461,6 +579,132 @@ mismo canon hace que el LMS futuro reciba su formato con el mismo patrón.
 **Pendiente para puesta en producción:** ejecutar `uv sync --extra db --group dev && uv run pytest`,
 insonorizar `DB_DSN` en el `.env` real y (opcional) contenerizar (`Dockerfile`). El flujo LTI→MCP→LMS
 queda validado con payloads reales de los casos 1 y 2 en esta misma sesión.
+
+### 7.6.5. Simulación de flujo de evaluación de ensayos (ejemplo oficial)
+
+> **Nota aclaratoria:** el Hub **NO descarga por su cuenta** las especificaciones, rúbrica y PDF
+> `course_id` mediante credenciales propias. El **LMS empuja** esos datos en el payload (`attachment.url`,
+> `submission.body`, `assignment.rubric`, `assignment.description`). Esa es la integración actual.
+
+#### 7.6.5.1. Esquema visual del flujo
+
+```text
+┌─────────────────────── ENTRADA (payload LTI / directa) ────────────────────────┐
+│  POST /ensayos/evaluar-flujo-completo (sync), /webhook-canvas o /enqueue (202) │
+│  Contexto automático: institución + curso + tarea; X-Context-ID opcional       │
+│  Body:   attachment.url | submission.body | origen_ensayo  +  rúbrica          │
+└──────────────────────────────┬─────────────────────────────────────────────────┘
+                               ▼
+┌────── 1. CONTEXTO TRANSVERSAL (InstitutionalContextMiddleware) ─────────────────┐
+│  Calcula/recupera context_id estable por institución/curso/tarea               │
+│  → persiste datos comunes del LMS y restaura el contexto en el worker          │
+└──────────────────────────────┬─────────────────────────────────────────────────┘
+                               ▼
+┌────── 2. CONTROL DE ENVÍOS (submission_tracker) ────────────────────────────────┐
+│  check_allowed(course_id, assignment_id, user_id_canvas)                      │
+│  · ¿lleva >= MAX_SUBMISSION_ATTEMPTS?  →  HTTP 429 (rechazo temprano sin LLM)  │
+│  · Si hay cupo → continúa (NO consume aún; registra al final)                  │
+└──────────────────────────────┬─────────────────────────────────────────────────┘
+                               ▼
+┌────── 3. RECONSTRUIR CONTEXTO + SLOT LMS ──────────────────────────────────────┐
+│  ctx = get_current_context()   institutional_context                          │
+│  slot LMS = rúbrica, curso, tarea, descripción y escala (compartidos)          │
+│  alumno y submission_id quedan solo en el payload/job individual               │
+└──────────────────────────────┬─────────────────────────────────────────────────┘
+                               ▼
+┌────── 4. EXTRACCIÓN DE DOCUMENTOS (document_parser.obtener_ensayos) ───────────┐
+│  · URL  → descarga (httpx) DOCX/PDF → texto plano                             │
+│  · text → directo                                                             │
+│  · consigna = _extraer_consigna_evaluable(assignment.description)             │
+└──────────────────────────────┬─────────────────────────────────────────────────┘
+                               ▼
+┌────── 5. COMPILADOR DE PROMPT (B1.3 prompt_compiler) ──────────────────────────┐
+│  directiva = ctx.to_system_instruction(budget_tokens=PROMPT_EVAL_CONTEXT_BUDGET)│
+│  · token_estimator mide; context_compressor comprime → SIEMPRE ≤ presupuesto   │
+└──────────────────────────────┬─────────────────────────────────────────────────┘
+                               ▼
+┌────── 6. INFERENCIA LLM (motor modelo.py + Hedged Racing) ─────────────────────┐
+│  prompt = «Eres evaluador académico formal… nota sobre la escala institucional»│
+│  + directiva + consigna + rúbrica + ensayo                                     │
+│  → OpenRouter (DeepSeek / free) → si falla, Circuit Breaker → otro modelo /     │
+│    Ollama (si configurado)                                                     │
+│  → parsea JSON estructurado → EvaluacionResultado                              │
+└──────────────────────────────┬─────────────────────────────────────────────────┘
+                               ▼
+┌────── 7. PERSISTENCIA + RESPUESTA ─────────────────────────────────────────────┐
+│  · guarda storage/evaluaciones/{id_entrega}/reporte_evaluacion.{json,md}       │
+│  · submission_tracker.register(...)  ← registra el intento (con nota)          │
+│  · canon = { status: EVALUADO, nota_final, rubric_assessment_canvas, … }       │
+│  · Sync → HTTP 200 canon · Async → estado EVALUATED en evaluation_jobs         │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Para envíos Canvas masivos, `POST /ensayos/webhook-canvas` devuelve un acuse `202` (`status: ENCOLADO`,
+`estado: PENDING`) con `evaluation_id`, `context_id` y datos de correlación. El cliente consulta
+`GET /ensayos/estado/{evaluation_id}`: recibe `PENDING`/`EVALUATING` mientras se procesa, el resultado
+canónico al completar o `ERROR` si falla. El `context_id` es determinista a partir de institución, curso
+y tarea; el contexto compartido excluye identidad del alumno y de la entrega.
+
+#### 7.6.5.2. Petición de ejemplo (CASO REAL)
+
+```http
+POST /ensayos/evaluar-flujo-completo
+```
+
+```json
+{
+  "course_id": "101",
+  "assignment_id": "TASK_001",
+  "user_id_canvas": "utpl_4821",
+  "origen_ensayo": "El presente ensayo analiza la planeación estratégica de la empresa…",
+  "origen_rubrica": [
+    { "id": "_c1", "points": 4, "description": "Rigor teórico", "ratings": [
+        { "id": "r1", "points": 4, "description": "Excelente" },
+        { "id": "r2", "points": 2, "description": "Regular" } ] }
+  ]
+}
+```
+
+> **Nota:** `student_id` no es un campo del modelo; se usa `user_id_canvas` (o alias).
+> El HUB deriva el contexto por institución/curso/tarea; la rúbrica puede omitirse si ya está guardada
+> en el slot LMS de ese contexto compartido.
+
+#### 7.6.5.3. Ejemplo de respuesta (canon)
+
+```json
+{
+  "status": "EVALUADO",
+  "pipeline": "completado",
+  "evaluation_id": "entrega_001",
+  "submission_id": "SUB_001",
+  "modelo_utilizado": "nvidia/nemotron-3-ultra-550b-a55b:free",
+  "nota_final": 8.5,
+  "escala_maxima": 10.0,
+  "feedback": "El estudiante demuestra dominio de la herramienta FODA…",
+  "criterios": [
+    { "id_criterio": "_c1", "criterio": "Rigor teórico", "nivel_alcanzado": "Excelente",
+      "puntaje_obtenido": 4, "puntaje_maximo": 4, "justificacion": "…", "evidencias_en_texto": ["…"] }
+  ],
+  "rubric_assessment_canvas": { "_c1": { "points": 4, "rating_id": "r1", "comments": "…" } },
+  "datos_lms": { "id_lms": "CANVAS", "course_id": "101", "assignment_id": "TASK_001",
+                 "user_id_canvas": "utpl_4821", "submission_id": "SUB_001" },
+  "reporte": { "status": "success", "id_entrega": "entrega_001",
+               "archivos_locales": { "json": "…/reporte_evaluacion.json",
+                                     "markdown": "…/reporte_evaluacion.md" } }
+}
+```
+
+#### 7.6.5.4. Diferencias clave con una simulación "ideal"
+
+| Punto | Simulación inicial | Realidad del código |
+|---|---|---|
+| Ruta | `/api/v1/ensayos/…` | `/ensayos/evaluar-flujo-completo` (o `/ensayos/enqueue`) |
+| Campo | `student_id` | `user_id_canvas` (alias aceptados) |
+| Origen del ensayo | Hub simplemente "recibe IDs" | Debe venir `origen_ensayo`/`attachment.url`/`submission.body` |
+| Descarga del LMS | Hub hace 3 llamadas proxy | El **LMS empuja** los datos en el payload (integración actual) |
+| Control de envíos | Registra al inicio | **Registra al final** (`register()` tras evaluación exitosa) |
+| Compresión de prompt | Forzar `compact=True` | **Compilador B1.3** `budget_tokens` (granular, garantizado) |
+| Slots | `assignment_specs` | `assignment_description` (slot `lms`) |
 
 ---
 

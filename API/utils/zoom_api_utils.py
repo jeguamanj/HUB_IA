@@ -37,6 +37,28 @@ ZOOM_CLIENT_ID = os.getenv("ZOOM_CLIENT_ID") or getattr(settings, "zoom_client_i
 ZOOM_CLIENT_SECRET = os.getenv("ZOOM_CLIENT_SECRET") or getattr(settings, "zoom_client_secret", "")
 
 _DEFAULT_TIMEOUT = 15.0
+_SYNC_TIMEOUT = 5.0
+_ASYNC_ZOOM_CLIENT = None
+
+
+async def get_async_zoom_client():
+    """Return the process-wide Zoom client with bounded connection pooling."""
+    global _ASYNC_ZOOM_CLIENT
+    import httpx
+
+    if _ASYNC_ZOOM_CLIENT is None or _ASYNC_ZOOM_CLIENT.is_closed:
+        _ASYNC_ZOOM_CLIENT = httpx.AsyncClient(
+            timeout=_DEFAULT_TIMEOUT,
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        )
+    return _ASYNC_ZOOM_CLIENT
+
+
+async def close_async_zoom_client() -> None:
+    global _ASYNC_ZOOM_CLIENT
+    if _ASYNC_ZOOM_CLIENT is not None and not _ASYNC_ZOOM_CLIENT.is_closed:
+        await _ASYNC_ZOOM_CLIENT.aclose()
+    _ASYNC_ZOOM_CLIENT = None
 
 
 # =============================================================================
@@ -60,7 +82,7 @@ def generate_zoom_token() -> str:
     url = f"https://zoom.us/oauth/token?grant_type=account_credentials&account_id={ZOOM_ACCOUNT_ID}"
     headers = {"Authorization": f"Basic {encoded_credentials}"}
 
-    response = requests.post(url, headers=headers)
+    response = requests.post(url, headers=headers, timeout=_SYNC_TIMEOUT)
 
     if response.status_code == 200:
         return response.json().get("access_token")
@@ -101,12 +123,12 @@ def detect_session_type(meeting_id: str, headers: dict) -> str:
     formatted_id = format_meeting_id(meeting_id)
 
     url_meeting = f"https://api.zoom.us/v2/meetings/{formatted_id}"
-    response_meeting = requests.get(url_meeting, headers=headers)
+    response_meeting = requests.get(url_meeting, headers=headers, timeout=_SYNC_TIMEOUT)
     if response_meeting.status_code == 200:
         return "meeting"
 
     url_webinar = f"https://api.zoom.us/v2/webinars/{formatted_id}"
-    response_webinar = requests.get(url_webinar, headers=headers)
+    response_webinar = requests.get(url_webinar, headers=headers, timeout=_SYNC_TIMEOUT)
     if response_webinar.status_code == 200:
         return "webinar"
 
@@ -144,7 +166,7 @@ def is_recurring_meeting(session_data: dict) -> bool:
 def zoom_get_user(user_id: str):
     url = f"https://api.zoom.us/v2/users/{user_id}"
     headers = get_zoom_auth_headers()
-    response = requests.get(url, headers=headers)
+    response = requests.get(url, headers=headers, timeout=_SYNC_TIMEOUT)
 
     if response.status_code not in (200, 201):
         raise HTTPException(response.status_code, response.text)
@@ -159,7 +181,7 @@ def zoom_get_licensed_users():
     results = []
 
     while True:
-        r = requests.get(url, headers=headers, params=params)
+        r = requests.get(url, headers=headers, params=params, timeout=_SYNC_TIMEOUT)
         if r.status_code != 200:
             raise HTTPException(r.status_code, r.text)
 
@@ -180,7 +202,7 @@ def zoom_get_scheduled_meetings(user_id: str):
     url = f"https://api.zoom.us/v2/users/{user_id}/meetings"
     headers = get_zoom_auth_headers()
 
-    r = requests.get(url, headers=headers)
+    r = requests.get(url, headers=headers, timeout=_SYNC_TIMEOUT)
     if r.status_code != 200:
         return []
 
@@ -200,7 +222,7 @@ def zoom_get_host_meetings(user_id: str, days: int = 90):
     }
     headers = get_zoom_auth_headers()
 
-    r = requests.get(url, headers=headers, params=params)
+    r = requests.get(url, headers=headers, params=params, timeout=_SYNC_TIMEOUT)
 
     if r.status_code == 404:
         return []  # No tiene reuniones como host
@@ -232,10 +254,8 @@ async def async_generate_zoom_token(timeout: float = _DEFAULT_TIMEOUT) -> str:
     )
     headers = {"Authorization": f"Basic {encoded_credentials}"}
 
-    import httpx
-
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(url, headers=headers)
+    client = await get_async_zoom_client()
+    response = await client.post(url, headers=headers, timeout=timeout)
 
     if response.status_code == 200:
         token = response.json().get("access_token")
@@ -258,18 +278,16 @@ async def async_detect_session_type(
     meeting_id: str, headers: dict, timeout: float = _DEFAULT_TIMEOUT
 ) -> str:
     """Detecta si el ID es meeting o webinar (asíncrono)."""
-    import httpx
-
     formatted = format_meeting_id(meeting_id)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        url_meeting = f"https://api.zoom.us/v2/meetings/{formatted}"
-        rm = await client.get(url_meeting, headers=headers)
-        if rm.status_code == 200:
-            return "meeting"
-        url_webinar = f"https://api.zoom.us/v2/webinars/{formatted}"
-        rw = await client.get(url_webinar, headers=headers)
-        if rw.status_code == 200:
-            return "webinar"
+    client = await get_async_zoom_client()
+    url_meeting = f"https://api.zoom.us/v2/meetings/{formatted}"
+    rm = await client.get(url_meeting, headers=headers, timeout=timeout)
+    if rm.status_code == 200:
+        return "meeting"
+    url_webinar = f"https://api.zoom.us/v2/webinars/{formatted}"
+    rw = await client.get(url_webinar, headers=headers, timeout=timeout)
+    if rw.status_code == 200:
+        return "webinar"
     return "meeting"
 
 
@@ -286,17 +304,16 @@ async def _async_zoom_request(
     Ejecuta una petición Zoom asíncrona y devuelve `httpx.Response`.
     Lanza `HTTPException` ante status >= 400 (salvo 404 que se devuelve como tal).
     """
-    import httpx
-
     headers = headers or await async_get_zoom_auth_headers(timeout=timeout)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.request(
-            method.upper(),
-            url,
-            headers=headers,
-            json=json,
-            params=params,
-        )
+    client = await get_async_zoom_client()
+    response = await client.request(
+        method.upper(),
+        url,
+        headers=headers,
+        json=json,
+        params=params,
+        timeout=timeout,
+    )
     if response.status_code >= 500:
         raise HTTPException(status_code=response.status_code, detail=response.text[:300])
     return response

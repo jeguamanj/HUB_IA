@@ -7,9 +7,8 @@
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, EmailStr
 from typing import List, Optional
+from contextlib import asynccontextmanager
 import json
-
-import httpx
 
 try:
     from API.core.logging import get_logger
@@ -23,6 +22,7 @@ try:
     from API.utils.zoom_api_utils import (
         async_get_zoom_auth_headers,
         async_detect_session_type,
+        get_async_zoom_client,
         format_meeting_id,
     )
 except ImportError:
@@ -30,13 +30,13 @@ except ImportError:
     from utils.zoom_api_utils import (
         async_get_zoom_auth_headers,
         async_detect_session_type,
+        get_async_zoom_client,
         format_meeting_id,
     )
 
 
 # URL base para las peticiones a la API de Zoom
 BASE_URL = "https://api.zoom.us/v2"
-DEFAULT_TIMEOUT = 15.0
 
 # -----------------------------------------------------
 # MODELOS DE ENTRADA
@@ -74,8 +74,9 @@ class MeetingUpdatePayload(BaseModel):
 # Helpers de petición asíncrona
 # -----------------------------------------------------
 
-async def _client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
+@asynccontextmanager
+async def _client():
+    yield await get_async_zoom_client()
 
 
 async def _get_headers() -> dict:

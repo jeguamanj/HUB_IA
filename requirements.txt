@@ -30,6 +30,7 @@ openpyxl==3.1.5
 
 # --- PostgreSQL (producción / Azure) ---
 asyncpg==0.29.0
+SQLAlchemy[asyncio]>=2.0.0,<3.0.0
 
 # --- Mensajería (ActiveMQ Artemis, opcional) ---
 stomp-py==9.0.0

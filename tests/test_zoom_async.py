@@ -12,9 +12,11 @@
 
 import inspect
 import sys
+import asyncio
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -22,6 +24,7 @@ if str(ROOT) not in sys.path:
 
 from API.services import zoom_license_management
 from API.services import zoom_management_service
+from API.services import zoom_reports
 from API.utils import zoom_api_utils
 
 
@@ -31,6 +34,60 @@ class TestAsyncEndpoints:
         assert endpoints, "no hay endpoints"
         for ep in endpoints:
             assert inspect.iscoroutinefunction(ep), f"{ep.__name__} NO es async"
+
+
+class TestZoomReportThreadpool:
+    def test_blocking_report_handlers_are_sync_and_use_fastapi_threadpool(self):
+        handlers = {
+            route.path: route.endpoint
+            for route in zoom_reports.router.routes
+            if hasattr(route, "endpoint")
+        }
+        for path in ("/zoom/report/check", "/zoom/report/excel"):
+            assert path in handlers
+            assert not inspect.iscoroutinefunction(handlers[path])
+
+    def test_reports_reuse_shared_zoom_helpers(self):
+        assert zoom_reports.generate_zoom_token is zoom_api_utils.generate_zoom_token
+        assert zoom_reports.format_meeting_id is zoom_api_utils.format_meeting_id
+        assert zoom_reports.detect_session_type is zoom_api_utils.detect_session_type
+
+    def test_report_client_reuses_thread_local_pool(self):
+        session = zoom_reports._get_zoom_session()
+        try:
+            assert zoom_reports._get_zoom_session() is session
+            assert session.get_adapter("https://")._pool_maxsize == 4
+        finally:
+            session.close()
+            del zoom_reports._zoom_session_local.session
+
+    def test_report_requests_have_long_timeout_and_reject_overload(self, monkeypatch):
+        class FakeSession:
+            def __init__(self):
+                self.kwargs = None
+
+            def get(self, url, **kwargs):
+                self.kwargs = kwargs
+                return "response"
+
+        session = FakeSession()
+        monkeypatch.setattr(zoom_reports, "_get_zoom_session", lambda: session)
+        assert zoom_reports._zoom_get("https://api.zoom.us/v2/test") == "response"
+        assert session.kwargs["timeout"] == 60.0
+
+        acquired = []
+        try:
+            for _ in range(zoom_reports.MAX_CONCURRENT_ZOOM_REPORTS):
+                zoom_reports._report_semaphore.acquire()
+                acquired.append(True)
+
+            with pytest.raises(HTTPException) as error:
+                zoom_reports._limited_report_concurrency(lambda: None)()
+            assert error.value.status_code == 429
+            assert error.value.headers["Retry-After"] == "5"
+        finally:
+            for _ in acquired:
+                zoom_reports._report_semaphore.release()
 
     def test_zoom_management_endpoints_are_async(self):
         router = zoom_management_service.get_router()
@@ -71,6 +128,55 @@ class TestAsyncUtils:
         # C2.3 mantiene la capa síncrona para zoom_reports.py (hasta C2.4).
         for name in ("generate_zoom_token", "get_zoom_auth_headers", "detect_session_type"):
             assert callable(getattr(zoom_api_utils, name, None))
+
+    def test_sync_zoom_helpers_use_short_network_timeouts(self, monkeypatch):
+        class Response:
+            status_code = 200
+
+        calls = []
+
+        def fake_get(url, **kwargs):
+            calls.append(kwargs)
+            return Response()
+
+        monkeypatch.setattr(zoom_api_utils.requests, "get", fake_get)
+        assert zoom_api_utils.detect_session_type("123", {}) == "meeting"
+        assert calls[0]["timeout"] == 5.0
+
+    def test_async_helpers_reuse_bounded_http_client(self, monkeypatch):
+        monkeypatch.setattr(zoom_api_utils, "_ASYNC_ZOOM_CLIENT", None)
+
+        async def verify_client_pool():
+            first = await zoom_api_utils.get_async_zoom_client()
+            second = await zoom_api_utils.get_async_zoom_client()
+            assert first is second
+            await zoom_api_utils.close_async_zoom_client()
+            assert first.is_closed
+
+        asyncio.run(verify_client_pool())
+
+
+def test_zoom_license_bulk_scans_reject_overlapping_requests(monkeypatch):
+    semaphore = asyncio.Semaphore(1)
+    monkeypatch.setattr(zoom_license_management, "_scan_semaphore", semaphore)
+
+    async def handler():
+        return "complete"
+
+    protected_handler = zoom_license_management._single_concurrent_scan(handler)
+
+    async def run():
+        assert await protected_handler() == "complete"
+        await semaphore.acquire()
+        try:
+            with pytest.raises(HTTPException) as error:
+                await protected_handler()
+            assert error.value.status_code == 429
+            assert error.value.headers["Retry-After"] == "5"
+        finally:
+            semaphore.release()
+
+    asyncio.run(run())
 
 
 class TestPureHelpers:

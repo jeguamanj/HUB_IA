@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import time
+import asyncio
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
@@ -44,6 +45,12 @@ class ContextRecord:
 
     def is_expired(self, now: Optional[float] = None) -> bool:
         now = now if now is not None else time.time()
+        lifecycle_type = self.data.get("lifecycle_type", "session")
+        if lifecycle_type == "activity":
+            if self.data.get("lifecycle_status", "active") != "closed":
+                return False
+            retention_until = self.data.get("retention_until")
+            return retention_until is not None and now > float(retention_until)
         return now > (self.created_at + self.ttl_seconds)
 
 
@@ -158,8 +165,8 @@ class SQLAlchemyContextBackend(ContextBackend):
         self.dsn = dsn
         self._engine: Optional[Any] = None
         self._SessionLocal: Optional[Any] = None
-        self._session: Optional[Any] = None
         self._ready = False
+        self._ready_lock = asyncio.Lock()
 
     # -- helpers de infraestructura (import diferido) ----------------------
     @staticmethod
@@ -170,60 +177,67 @@ class SQLAlchemyContextBackend(ContextBackend):
         """Importa SQLAlchemy, construye engine y crea tablas (perezoso)."""
         if self._ready:
             return
-        try:
-            from sqlalchemy import JSON, Text
-            from sqlalchemy.ext.asyncio import (
-                AsyncSession,
-                async_sessionmaker,
-                create_async_engine,
-            )
-            from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+        async with self._ready_lock:
+            if self._ready:
+                return
+            try:
+                from sqlalchemy import Float, Integer, Text
+                from sqlalchemy.ext.asyncio import (
+                    AsyncSession,
+                    async_sessionmaker,
+                    create_async_engine,
+                )
+                from sqlalchemy.orm import DeclarativeBase, mapped_column
 
-            # Mapear relative sqlite DSN a ruta dentro del proyecto.
-            dsn = self.dsn
-            if dsn.startswith("sqlite+aiosqlite:///./"):
-                rel = dsn.split("///./", 1)[1]
-                from pathlib import Path
+                dsn = self.dsn
+                if dsn.startswith("sqlite+aiosqlite:///./"):
+                    rel = dsn.split("///./", 1)[1]
+                    from pathlib import Path
 
-                Path(rel).parent.mkdir(parents=True, exist_ok=True)
+                    Path(rel).parent.mkdir(parents=True, exist_ok=True)
 
-            class Base(DeclarativeBase):
-                pass
+                class Base(DeclarativeBase):
+                    pass
 
-            class ContextRow(Base):
-                __tablename__ = "contexts"
-                context_id: Mapped[str] = mapped_column(Text, primary_key=True)
-                created_at: Mapped[int] = mapped_column(nullable=False, default=lambda: int(time.time()))
-                ttl_seconds: Mapped[int] = mapped_column(nullable=False, default=3600)
-                data: Mapped[str] = mapped_column(JSON, nullable=False, default=dict)
+                class ContextRow(Base):
+                    __tablename__ = "contexts"
+                    context_id = mapped_column(Text, primary_key=True)
+                    created_at = mapped_column(Float, nullable=False, default=time.time)
+                    ttl_seconds = mapped_column(Integer, nullable=False, default=3600)
+                    data = mapped_column(Text, nullable=False, default="{}")
 
-            self._engine = create_async_engine(dsn)
-            self._SessionLocal = async_sessionmaker(self._engine, class_=AsyncSession, expire_on_commit=False)
-            self._row_model = ContextRow
+                self._engine = create_async_engine(dsn)
+                self._SessionLocal = async_sessionmaker(
+                    self._engine,
+                    class_=AsyncSession,
+                    expire_on_commit=False,
+                )
+                self._row_model = ContextRow
 
-            async with self._engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
+                if not dsn.startswith(("postgresql+", "postgres+")):
+                    async with self._engine.begin() as conn:
+                        await conn.run_sync(Base.metadata.create_all)
 
-            self._ready = True
-        except Exception as exc:  # driver ausente, servicio caído, etc.
-            raise RuntimeError(f"No se pudo inicializar el backend SQLAlchemy: {exc}") from exc
-
-    async def _get_session(self):
-        await self._ensure_ready()
-        if self._session is None or self._session.closed:
-            self._session = self._SessionLocal()
-        return self._session
+                self._ready = True
+            except Exception as exc:  # driver ausente, servicio caído, etc.
+                if self._engine is not None:
+                    await self._engine.dispose()
+                    self._engine = None
+                    self._SessionLocal = None
+                raise RuntimeError(
+                    f"No se pudo inicializar el backend SQLAlchemy: {exc}"
+                ) from exc
 
     # -- CRUD --------------------------------------------------------------
     async def create(self, record: ContextRecord) -> None:
         await self.save(record)
 
     async def save(self, record: ContextRecord) -> None:
-        session = await self._get_session()
+        await self._ensure_ready()
         Row = self._row_model
-        try:
-            import sqlalchemy as sa
+        import sqlalchemy as sa
 
+        async with self._SessionLocal() as session:
             stmt = sa.select(Row).where(Row.context_id == record.context_id)
             result = await session.execute(stmt)
             row = result.scalar_one_or_none()
@@ -231,66 +245,63 @@ class SQLAlchemyContextBackend(ContextBackend):
             if row is None:
                 session.add(Row(
                     context_id=record.context_id,
-                    created_at=int(record.created_at),
+                    created_at=float(record.created_at),
                     ttl_seconds=record.ttl_seconds,
                     data=payload,
                 ))
             else:
-                row.created_at = int(record.created_at)
+                row.created_at = float(record.created_at)
                 row.ttl_seconds = record.ttl_seconds
                 row.data = payload
             await session.commit()
-        except Exception as exc:
-            await session.rollback()
-            raise exc
 
     async def get(self, context_id: str) -> Optional[ContextRecord]:
-        session = await self._get_session()
+        await self._ensure_ready()
         import sqlalchemy as sa
 
         Row = self._row_model
-        result = await session.execute(sa.select(Row).where(Row.context_id == context_id))
-        row = result.scalar_one_or_none()
-        if row is None:
-            return None
-        rec = self.dict_to_record(
-            {
-                "context_id": row.context_id,
-                "created_at": float(row.created_at),
-                "ttl_seconds": int(row.ttl_seconds),
-                "data": row.data if isinstance(row.data, str) else json.dumps(row.data, ensure_ascii=False),
-            }
-        )
+        async with self._SessionLocal() as session:
+            result = await session.execute(
+                sa.select(Row).where(Row.context_id == context_id)
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return None
+            rec = self.dict_to_record(
+                {
+                    "context_id": row.context_id,
+                    "created_at": float(row.created_at),
+                    "ttl_seconds": int(row.ttl_seconds),
+                    "data": row.data if isinstance(row.data, str) else json.dumps(row.data, ensure_ascii=False),
+                }
+            )
         if rec.is_expired():
             await self.delete(context_id)
             return None
         return rec
 
     async def delete(self, context_id: str) -> bool:
-        session = await self._get_session()
+        await self._ensure_ready()
         import sqlalchemy as sa
 
         Row = self._row_model
-        result = await session.execute(sa.delete(Row).where(Row.context_id == context_id))
-        await session.commit()
+        async with self._SessionLocal() as session:
+            result = await session.execute(
+                sa.delete(Row).where(Row.context_id == context_id)
+            )
+            await session.commit()
         return result.rowcount > 0
 
     async def list_ids(self) -> List[str]:
-        session = await self._get_session()
+        await self._ensure_ready()
         import sqlalchemy as sa
 
         Row = self._row_model
-        result = await session.execute(sa.select(Row.context_id))
-        ids = [row[0] for row in result.all()]
-        return ids
+        async with self._SessionLocal() as session:
+            result = await session.execute(sa.select(Row.context_id))
+            return [row[0] for row in result.all()]
 
     async def close(self) -> None:
-        if self._session is not None:
-            try:
-                await self._session.close()
-            except Exception:
-                pass
-            self._session = None
         if self._engine is not None:
             try:
                 await self._engine.dispose()
@@ -310,6 +321,12 @@ def _make_memory_backend() -> InMemoryContextBackend:
 def _sqlalchemy_driver_available(dsn: str) -> bool:
     """Comprueba (sin event-loops) si el driver del dialecto está instalado."""
     dialect = dsn.split("://", 1)[0].lower()
+    if dialect not in {
+        "sqlite+aiosqlite",
+        "postgresql+asyncpg",
+        "postgres+asyncpg",
+    }:
+        return False
     require = []
     if dialect.startswith("sqlite"):
         require = ["sqlalchemy", "aiosqlite"]

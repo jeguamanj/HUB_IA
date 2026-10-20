@@ -7,6 +7,8 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from datetime import datetime, timedelta
+import asyncio
+from functools import wraps
 import csv
 import io
 
@@ -18,6 +20,7 @@ try:
         async_zoom_get_scheduled_meetings,
         async_zoom_get_host_meetings,
         async_get_zoom_auth_headers,
+        get_async_zoom_client,
     )
     from API.config import ZOOM_CONFIG
 except ImportError:
@@ -28,12 +31,29 @@ except ImportError:
         async_zoom_get_scheduled_meetings,
         async_zoom_get_host_meetings,
         async_get_zoom_auth_headers,
+        get_async_zoom_client,
     )
     # pyrefly: ignore [missing-import]
     from config import ZOOM_CONFIG
 
 
 router = APIRouter()
+_scan_semaphore = asyncio.Semaphore(1)
+
+
+def _single_concurrent_scan(handler):
+    @wraps(handler)
+    async def wrapped(*args, **kwargs):
+        if _scan_semaphore.locked():
+            raise HTTPException(
+                status_code=429,
+                detail="Ya hay un escaneo Zoom en proceso. Intente nuevamente.",
+                headers={"Retry-After": "5"},
+            )
+        async with _scan_semaphore:
+            return await handler(*args, **kwargs)
+
+    return wrapped
 
 # ============================================================
 # CONFIGURACIÓN DE POLÍTICAS
@@ -124,6 +144,7 @@ async def evaluate_user(user_id: str):
 # ============================================================
 
 @router.get("/scan")
+@_single_concurrent_scan
 async def scan_all_users():
     users = await async_zoom_get_licensed_users()
     results = []
@@ -153,6 +174,7 @@ async def scan_all_users():
 # ============================================================
 
 @router.get("/report/csv")
+@_single_concurrent_scan
 async def report_csv():
     users = await async_zoom_get_licensed_users()
 
@@ -181,14 +203,11 @@ async def downgrade_license(user_id: str):
     """
     Cambia una licencia a BASIC (type = 1).
     """
-    import httpx
-
     url = f"https://api.zoom.us/v2/users/{user_id}"
     body = {"type": 1}
     headers = await async_get_zoom_auth_headers()
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        response = await client.patch(url, headers=headers, json=body)
+    client = await get_async_zoom_client()
+    response = await client.patch(url, headers=headers, json=body, timeout=15.0)
 
     if response.status_code not in (200, 204):
         raise HTTPException(response.status_code, response.text)

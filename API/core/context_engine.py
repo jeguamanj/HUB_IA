@@ -3,7 +3,10 @@
 import os
 import time
 import uuid
+import hashlib
+import json
 import contextvars
+from contextlib import contextmanager
 from typing import Optional, Dict, Any, Tuple, List
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -32,6 +35,20 @@ except ImportError:  # pragma: no cover
 
 logger = get_logger("core.context_engine")
 
+
+# Shared identity fallback used by LMS context initialization and evaluation.
+DEFAULT_LMS_INSTITUTION_ID = "UNIVERSIDAD_TECNICA_PARTICULAR_DE_LOJA_UTPL"
+
+
+def lms_activity_context_id(institution_id: str, course_id: str, assignment_id: str) -> str:
+    identity = json.dumps(
+        [institution_id, course_id, assignment_id],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return f"ctx_lms_{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+
+
 # ContextVar local para propagación transparente a través de llamadas asíncronas
 _current_context_var: contextvars.ContextVar[Optional['InstitutionalContext']] = contextvars.ContextVar(
     "current_institutional_context", default=None
@@ -51,6 +68,16 @@ def set_current_context(ctx: Optional['InstitutionalContext']):
     _current_context_var.set(ctx)
 
 
+@contextmanager
+def use_current_context(ctx: Optional['InstitutionalContext']):
+    """Temporarily bind a context to the current async task and restore it afterward."""
+    token = _current_context_var.set(ctx)
+    try:
+        yield
+    finally:
+        _current_context_var.reset(token)
+
+
 # ============================================================
 # MODELO DEL ENVELOPE DE CONTEXTO INSTITUCIONAL
 # ============================================================
@@ -62,6 +89,11 @@ class InstitutionalContext(BaseModel):
     context_id: str = Field(default_factory=lambda: f"ctx_{uuid.uuid4().hex[:12]}")
     created_at: float = Field(default_factory=time.time)
     ttl_seconds: int = Field(default=3600)  # 1 hora por defecto
+    lifecycle_type: str = Field(default="session")
+    lifecycle_status: str = Field(default="active")
+    grace_period_days: int = Field(default=3, ge=0, le=365)
+    closed_at: Optional[float] = None
+    retention_until: Optional[float] = None
 
     # Versión del contrato de slots (FASE 1 · B1.1 `context-contract`).
     # Contextos persistidos con anterioridad no traen el campo → `ensure_schema`
@@ -69,7 +101,7 @@ class InstitutionalContext(BaseModel):
     schema_version: int = Field(default=SCHEMA_VERSION, description="Versión del contrato de los slots")
 
     # 1. Identidad y Gobernanza Institucional (Global)
-    institution_id: str = Field(default="UNIVERSIDAD_TECNICA_PARTICULAR_DE_LOJA_UTPL", description="Código o nombre de la institución")
+    institution_id: str = Field(default="UNIVERSIDAD TECNICA_PARTICULAR DE LOJA - UTPL", description="UTPL")
     tenant_id: Optional[str] = Field(default="GENERAL", description="Facultad, sede o departamento")
     system_source: str = Field(default="GENERIC_API", description="Sistema origen: CANVAS_LMS, HUBSPOT_CRM, ZOOM_APP, N8N_FLOW")
     user_id: Optional[str] = Field(default=None, description="Identificador único del usuario actor")
@@ -98,6 +130,10 @@ class InstitutionalContext(BaseModel):
     )
 
     def is_expired(self) -> bool:
+        if self.lifecycle_type == "activity":
+            if self.lifecycle_status != "closed" or self.retention_until is None:
+                return False
+            return time.time() > self.retention_until
         return time.time() > (self.created_at + self.ttl_seconds)
 
     def get_slot(self, slot_name: str) -> Dict[str, Any]:
@@ -132,13 +168,42 @@ class InstitutionalContext(BaseModel):
             )
         self.schema_version = to_version
 
-    def to_system_instruction(self, compact: bool = False) -> str:
+    def to_system_instruction(
+        self,
+        compact: bool = False,
+        budget_tokens: Optional[int] = None,
+        language: Optional[str] = None,
+    ) -> str:
         """
         Compila el contexto institucional en un bloque de instrucciones de alta densidad
         para inyectar en el System Prompt de cualquier LLM (Ollama, NVIDIA, DeepSeek, etc.).
-        Cuando compact=True (por ejemplo en evaluación de ensayos), omite metadatos administrativos
-        (course_id, assignment_id, account_id) y decoradores para maximizar el ahorro de tokens.
+
+        Modos de operación (granularidad B1.3):
+
+        1. `budget_tokens` (int) → Compresión por PRESUPUESTO. Delega en el compilador
+           avanzado (`compile_context`), que estima tokens y comprime de forma
+           inteligente (prioriza campos críticos, recorta slots, conserva entidades)
+           GARANTIZANDO que el resultado quepa en la ventana de contexto dada.
+           Es la vía recomendada: no es un binario, sino un tope medible de tokens.
+
+        2. `compact=True/False` (modo legacy) → Comportamiento original conservado
+           para no romper llamadas existentes. Sigue siendo binario, pero se
+           mantiene por compatibilidad.
+
+        Args:
+            compact: Modo compacto legacy (omite metadatos administrativos y decoradores).
+            budget_tokens: Tope máximo de tokens. Si se indica, se usa el compilador
+                           avanzado para respetarlo (ignora compact).
+            language: Hint de idioma (es/en...) para la heurística de tokens.
+
+        Returns:
+            str con el bloque de instrucciones optimizado.
         """
+        # Vía avanzada (recomendada): presupuesto medible de tokens.
+        if budget_tokens is not None:
+            return self.compile_context(budget=budget_tokens, language=language).text
+
+        # Vía legacy (retro-compatible): binaria.
         if compact:
             partes = [f"Directiva: {self.institution_id}"]
             if self.evaluation_scale:
@@ -205,6 +270,41 @@ class InstitutionalContext(BaseModel):
             budget = COMPACT_TOKEN_BUDGET if compact else FULL_TOKEN_BUDGET
         return SystemPrompt(text=text, tokens=tokens, budget=budget)
 
+    # ------------------------------------------------------------------
+    # Compilación avanzada con presupuesto de tokens (B1.3 prompt-compiler)
+    # ------------------------------------------------------------------
+    def compile_context(
+        self,
+        budget: Optional[int] = None,
+        language: Optional[str] = None,
+    ) -> "CompiledContext":
+        """
+        Compila el contexto usando el compilador avanzado (comprime si excede
+        el presupuesto de tokens y genera metadatos de auditoría).
+
+        Args:
+            budget: presupuesto máximo de tokens del prompt de sistema.
+            language: hint de idioma (es/en/...).
+
+        Returns:
+            CompiledContext(text, report, compact).
+        """
+        from API.core.prompt_compiler import (
+            build_budget_report,
+            compile_context_prompt,
+        )
+
+        # serializar el contexto a dict (model_dump) para el compilador
+        ctx_dict = self.model_dump(mode="json")
+
+        if budget is None:
+            budget = int(os.getenv("PROMPT_SYSTEM_BUDGET", "1024"))
+
+        report = build_budget_report(ctx_dict, budget=budget, language=language)
+        text = compile_context_prompt(ctx_dict, budget=budget, language=language)
+
+        return CompiledContext(text=text, report=report, compact=False)
+
 
 # ============================================================
 # COMPILADOR DE PROMPT INSTITUCIONAL (FASE 1 · B1.3 `prompt-compiler`)
@@ -239,6 +339,35 @@ class SystemPrompt:
             "tokens": self.tokens,
             "budget": self.budget,
             "within_budget": self.within_budget,
+        }
+
+
+class CompiledContext:
+    """
+    Resultado de la compilación avanzada de contexto (B1.3 prompt-compiler).
+    Incluye metadatos de auditoría de presupuesto.
+    """
+
+    __slots__ = ("text", "report", "compact")
+
+    def __init__(self, text: str, report: Any, compact: bool):
+        self.text = text
+        self.report = report      # ContextBudgetReport
+        self.compact = compact
+
+    @property
+    def tokens(self) -> int:
+        return self.report.output_tokens
+
+    @property
+    def within_budget(self) -> bool:
+        return self.report.utilization <= 1.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "text": self.text,
+            "report": self.report.to_dict(),
+            "compact": self.compact,
         }
 
 
@@ -376,6 +505,52 @@ class ContextStore:
         except Exception as exc:  # nunca romper el flujo por persistencia
             logger.warning("ContextStore: fallo de persistencia para %s: %s", ctx.context_id, exc)
 
+    async def save_durable(self, ctx: InstitutionalContext) -> None:
+        """Update the in-memory cache and require a successful durable write."""
+        self._contexts[ctx.context_id] = ctx
+        if self._backend is not None:
+            await self._backend.save(self._to_record(ctx))
+
+    async def get_or_restore(self, context_id: str) -> Optional[InstitutionalContext]:
+        """Return a cached context or restore it from the durable backend."""
+        cached = self.get(context_id)
+        if cached is not None:
+            return cached
+        if self._backend is None:
+            return None
+
+        record = await self._backend.get(context_id)
+        if record is None:
+            return None
+        ctx = InstitutionalContext.model_validate(record.data)
+        if ctx.is_expired():
+            await self._backend.delete(context_id)
+            return None
+        self._contexts[context_id] = ctx
+        return ctx
+
+    async def close_activity(
+        self,
+        context_id: str,
+        grace_period_days: Optional[int] = None,
+    ) -> Optional[InstitutionalContext]:
+        """Close an LMS activity context and start its post-close retention window."""
+        ctx = await self.get_or_restore(context_id)
+        if ctx is None:
+            return None
+        if ctx.lifecycle_type != "activity":
+            raise ValueError("Solo se pueden cerrar contextos asociados a actividades LMS.")
+        if grace_period_days is not None:
+            if not 0 <= grace_period_days <= 365:
+                raise ValueError("grace_period_days debe estar entre 0 y 365.")
+            ctx.grace_period_days = grace_period_days
+        if ctx.lifecycle_status != "closed":
+            ctx.lifecycle_status = "closed"
+            ctx.closed_at = time.time()
+            ctx.retention_until = ctx.closed_at + ctx.grace_period_days * 86400
+        await self.save_durable(ctx)
+        return ctx
+
     async def _persist_delete(self, context_id: str) -> None:
         if self._backend is None:
             return
@@ -442,6 +617,20 @@ class ContextStore:
             return True
         return False
 
+    def stats(self) -> Dict[str, Any]:
+        self._clean_expired()
+        return {
+            "total": len(self._contexts),
+            "backend": getattr(self._backend, "name", "memory"),
+        }
+
+    async def close(self) -> None:
+        """Close the durable backend at application shutdown."""
+        backend = self._backend
+        self._backend = None
+        if backend is not None:
+            await backend.close()
+
     def _clean_expired(self):
         now = time.time()
         expired = [cid for cid, c in self._contexts.items() if now > (c.created_at + c.ttl_seconds)]
@@ -475,7 +664,15 @@ def init_durable_store(dsn: str = "", logger_override=None) -> "ContextStore":
 
     context_store._backend = backend
     if backend is not None:
-        _run_async_sync(context_store.load_from_backend())
+        try:
+            # Force connection/schema errors to surface during startup rather
+            # than leaving a backend selected that cannot persist contexts.
+            _run_async_sync(backend.list_ids())
+            _run_async_sync(context_store.load_from_backend())
+        except Exception as exc:
+            logger.warning("ContextStore: backend durable no disponible: %s", exc)
+            _run_async_sync(backend.close())
+            context_store._backend = None
     else:
         logger.info("ContextStore: sin backend durable (memoria transitoria).")
 
@@ -503,7 +700,7 @@ class InstitutionalContextMiddleware(BaseHTTPMiddleware):
         active_context: Optional[InstitutionalContext] = None
 
         if context_id:
-            active_context = context_store.get(context_id)
+            active_context = await context_store.get_or_restore(context_id)
 
         # Si no había un context_id registrado pero el cliente envía headers institucionales, crear uno efímero
         if not active_context and (tenant_id or institution_id or user_role):

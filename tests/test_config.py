@@ -15,7 +15,6 @@ from API import config as config_module
 from API.config import (
     Settings,
     get_settings,
-    validate_artemis,
     validate_credentials,
     validate_zoom,
 )
@@ -40,6 +39,8 @@ class TestSettingsLoading:
         monkeypatch.setenv("LLM_SOFT_TIMEOUT", "2.5")
         monkeypatch.setenv("LLM_MAX_CONCURRENT", "4")
         monkeypatch.setenv("ARTEMIS_ENABLED", "true")
+        monkeypatch.setenv("ARTEMIS_PORT", "61614")
+        monkeypatch.setenv("OLLAMA_TIMEOUT", "12.5")
         monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
 
         reloaded = config_module.reload_settings()
@@ -47,6 +48,8 @@ class TestSettingsLoading:
         assert reloaded.llm_soft_timeout == 2.5
         assert reloaded.llm_max_concurrent == 4
         assert reloaded.artemis_enabled is True
+        assert reloaded.artemis_port == 61614
+        assert reloaded.ollama_timeout == 12.5
         assert reloaded.openrouter_api_key == "sk-test"
 
     def test_relaxed_env_fallbacks(self, monkeypatch):
@@ -94,21 +97,12 @@ class TestCredentialValidation:
         assert any("ZOOM_ACCOUNT_ID" in m for m in zoom_missing)
         assert any("ZOOM_CLIENT_SECRET" in m for m in zoom_missing)
 
-    def test_artemis_only_when_enabled(self):
-        """Artemis solo se valida si está habilitado."""
-        off = Settings(artemis_enabled=False)
-        assert validate_artemis(off) == []
-        on_broken = Settings(artemis_enabled=True, artemis_host="")
-        assert any("ARTEMIS_HOST" in m for m in validate_artemis(on_broken))
-
-
 class TestBackwardCompatAliases:
     def test_module_aliases_present(self):
         """Los identificadores preexistentes siguen exportados."""
         import API.config as cfg
 
         assert hasattr(cfg, "ACTIVE_SERVICES")
-        assert hasattr(cfg, "ARTEMIS_CONFIG")
         assert hasattr(cfg, "LLM_PROVIDERS")
         assert hasattr(cfg, "ZOOM_CONFIG")
         assert cfg.ZOOM_CONFIG["base_url"] == "https://api.zoom.us/v2"

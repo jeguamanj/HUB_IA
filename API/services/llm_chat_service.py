@@ -5,6 +5,7 @@ try:
     from API.llm_providers import deepseek, gemini, openai, modelo, ollama
     from API.llm_providers import openrouter_catalog
     from API.core.context_engine import get_current_context
+    from API.config import get_settings
 except ImportError:
     # pyrefly: ignore [missing-import]
     from llm_providers import deepseek, gemini, openai, modelo, ollama
@@ -12,6 +13,8 @@ except ImportError:
     from llm_providers import openrouter_catalog
     # pyrefly: ignore [missing-import]
     from core.context_engine import get_current_context
+    # pyrefly: ignore [missing-import]
+    from config import get_settings
 
 
 router = APIRouter()
@@ -37,7 +40,16 @@ async def chat_llm(request: LLMChatRequest):
 
     # Resolver contexto institucional si está activo en la sesión/solicitud
     ctx = get_current_context()
-    institutional_sys_prompt = ctx.to_system_instruction() if ctx else ""
+    if ctx:
+        # Directiva institucional COMPRIMIDA por presupuesto de tokens (B1.3).
+        # Configurable a nivel de institución vía `PROMPT_CHAT_CONTEXT_BUDGET`
+        # (default 1024). El compilador garantiza que no exceda el tope.
+        cfg = get_settings()
+        budget = getattr(cfg, "prompt_chat_context_budget", 1024)
+        language = getattr(cfg, "prompt_context_language", None)
+        institutional_sys_prompt = ctx.to_system_instruction(budget_tokens=budget, language=language)
+    else:
+        institutional_sys_prompt = ""
     user_sys_prompt = request.system_prompt or ""
     combined_sys_prompt = f"{institutional_sys_prompt}\n{user_sys_prompt}".strip() if (institutional_sys_prompt or user_sys_prompt) else None
 
@@ -68,7 +80,11 @@ async def chat_llm(request: LLMChatRequest):
     elif provider in ["gemini", "gemma"]:
         return await gemini.chat(request.prompt)
     elif provider == "openai":
-        return await openai.chat(request.prompt)
+        res = await openai.chat(prompt_payload, model=request.model)
+        if ctx and "error" not in res:
+            res["context_id"] = ctx.context_id
+            res["tenant_id"] = ctx.tenant_id
+        return res
     else:
         raise HTTPException(status_code=400, detail=f"Proveedor LLM '{request.provider}' no soportado")
 
