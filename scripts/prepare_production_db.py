@@ -11,7 +11,7 @@ import asyncpg
 from API.core.postgres_migrations import MIGRATIONS_DIR
 
 _IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
-_MIN_PASSWORD_LENGTH = 24
+_MIN_PASSWORD_LENGTH = 12
 
 
 def _identifier(value: str, label: str) -> str:

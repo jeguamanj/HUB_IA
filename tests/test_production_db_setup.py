@@ -4,7 +4,15 @@ from pathlib import Path
 
 import pytest
 
-from scripts.prepare_production_db import _connection_args, _identifier
+from scripts.prepare_production_db import (
+    _MIN_PASSWORD_LENGTH,
+    _connection_args,
+    _identifier,
+)
+
+
+def test_database_password_minimum_is_twelve_characters():
+    assert _MIN_PASSWORD_LENGTH == 12
 
 
 def test_database_identifier_is_restricted_to_safe_postgres_names():
