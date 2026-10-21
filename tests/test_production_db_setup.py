@@ -35,6 +35,11 @@ def test_remote_admin_dsn_requires_tls():
     assert args["ssl"] is True
 
 
+def test_admin_dsn_without_username_explains_expected_format():
+    with pytest.raises(ValueError, match="usuario DBA.*base nueva"):
+        _connection_args("postgresql://db.example.org:5432/postgres?sslmode=require")
+
+
 def test_production_runtime_schema_migration_has_matching_checksum():
     migration_path = (
         Path(__file__).resolve().parents[1]

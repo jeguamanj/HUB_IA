@@ -170,13 +170,56 @@ DB_DSN=postgresql+asyncpg://hub_test_user:URL_ENCODED_PASSWORD@localhost:5432/hu
 ```
 
 En desarrollo, el `lifespan` aplica migraciones pendientes al iniciar. En
-producción, ejecuta antes `python -m API.core.postgres_migrations apply` en un
-paso administrativo con `MIGRATION_DB_DSN` (rol DDL); el proceso de API usa
+producción, primero sigue el apartado
+[Aprovisionamiento PostgreSQL de producción](#aprovisionamiento-postgresql-de-producci%C3%B3n)
+para elegir el flujo según exista o no la base. El script de base nueva ya
+instala las migraciones; para una base existente, aplica las migraciones
+pendientes con `python -m API.core.postgres_migrations apply` en un paso
+administrativo usando `MIGRATION_DB_DSN` (rol DDL). El proceso de API usa
 `DB_DSN` con un rol runtime sin permisos DDL y solo verifica que el esquema esté
 al día. Si faltan migraciones, producción no inicia. No guardes ambas
 credenciales en el entorno runtime de la API.
 Si la contraseña contiene caracteres reservados de URL, deben codificarse.
 Mantén PostgreSQL de pruebas separado de cualquier base con datos reales.
+
+### Aprovisionamiento PostgreSQL de producción
+
+El script `python -m scripts.prepare_production_db` **solo se ejecuta para
+crear desde cero una base que todavía no existe**, junto con dos roles nuevos:
+uno DDL (`hub_migrator`) y uno runtime (`hub_runtime`). También instala las
+migraciones actuales y configura los permisos iniciales. Ejecútalo una sola
+vez, desde una versión aprobada del repositorio y con autorización/acceso DBA.
+
+**Si la base todavía no existe:**
+
+1. Confirma que tampoco existen los roles que vas a crear. El script rechaza
+   tanto una base existente (aunque esté vacía) como cualquiera de esos roles.
+2. Ejecuta desde la raíz del proyecto:
+
+   ```powershell
+   python -m scripts.prepare_production_db
+   ```
+
+3. En el prompt oculto, proporciona el DSN de una base administrativa
+   (`postgres` u otra base existente), con usuario DBA y TLS si la conexión es
+   remota. El DSN debe incluir usuario y contraseña; codifica como URL los
+   caracteres reservados. El script oculta la entrada y no la guarda. Después
+   ingresa el nombre nuevo de la base, los nombres/contraseñas de los roles y
+   confirma escribiendo exactamente `CREAR <nombre_de_base>`.
+
+**Si la base ya existe, no ejecutes ese script**, aunque solo falte el rol
+runtime o la base parezca vacía. No intentes resolverlo agregando el usuario
+DBA al DSN: ese requisito solo corrige el formato de conexión para el flujo de
+base nueva, no convierte el script en una herramienta de actualización. Sigue
+la guía [Base existente y rol runtime pendiente](migrations/README.md#base-existente-y-rol-runtime-pendiente)
+para crear/verificar el rol runtime, revisar el ledger y aplicar migraciones
+con el rol DDL. Si ya hay esquema o historial de migraciones, detente ante
+discrepancias y resuélvelas con backup antes de modificarlo.
+
+En ambos flujos, la API debe usar `DB_DSN` con el rol runtime. `MIGRATION_DB_DSN`
+es solo para aplicar migraciones mediante
+`python -m API.core.postgres_migrations apply`; **no es el comando de
+aprovisionamiento** y no debe quedar configurado en el servicio runtime.
 
 Para `APP_ENV=production`, configura `API_CLIENT_AUTH_ENABLED=true`,
 `HUB_DOCS_USERNAME`, `HUB_DOCS_PASSWORD` (mínimo 16 caracteres),

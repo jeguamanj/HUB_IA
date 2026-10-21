@@ -31,7 +31,11 @@ def _connection_args(dsn: str, database: str | None = None) -> dict:
             "El DSN administrativo debe usar postgresql:// o postgres:// y un host."
         )
     if not parsed.username:
-        raise ValueError("El DSN administrativo debe especificar el usuario DBA.")
+        raise ValueError(
+            "El DSN administrativo debe incluir usuario DBA, por ejemplo "
+            "postgresql://usuario@host:5432/postgres?sslmode=require. "
+            "Este asistente es solo para crear una base nueva."
+        )
     if not database and not parsed.path.strip("/"):
         raise ValueError("El DSN administrativo debe especificar la base de mantenimiento.")
 

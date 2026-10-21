@@ -106,12 +106,13 @@ Preparación manual requerida:
 4. Configurar las mismas variables runtime requeridas en Azure (con su propio
    `DB_DSN` runtime), excepto valores específicos del proveedor/host. No copiar
    `MIGRATION_DB_DSN` al servicio.
-5. Preparar la base nueva con `python -m scripts.prepare_production_db` desde
-   el checkout aprobado. El asistente pide DSN DBA, nombre de base y
-   contraseñas sin imprimirlas, exige confirmación, rechaza bases/roles
-   existentes y aplica `001`–`004`. Requiere PostgreSQL 15+; revisar
-   [migrations/README.md](./migrations/README.md) y obtener backup/ventana
-   aprobados antes de ejecutarlo.
+5. Si la base aún no existe, prepararla con
+   `python -m scripts.prepare_production_db` desde el checkout aprobado. El
+   asistente crea únicamente una base/roles nuevos y rechaza objetos existentes.
+   Si la base y el usuario DDL ya existen, **no uses ese asistente**: sigue
+   “Base existente y rol runtime pendiente” en
+   [migrations/README.md](./migrations/README.md) para crear el rol runtime,
+   preparar grants y ejecutar las migraciones sin DDL en el servicio.
 6. Configurar `DB_DSN` runtime y `MIGRATION_DB_DSN` DDL por separado. Mantener
    los secretos en `/etc/mcp-hub/runtime.env` (root propietario, permisos
    `0640`, grupo `mcp-hub`) o gestor de secretos; nunca dentro del checkout.

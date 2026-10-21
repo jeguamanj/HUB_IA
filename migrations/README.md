@@ -63,6 +63,118 @@ servicio. Usa `MIGRATION_DB_DSN` con el rol DDL solo durante operaciones de
 migración. No pongas la contraseña en argumentos de comandos, Git, logs o
 archivos dentro del checkout.
 
+## Base existente y rol runtime pendiente
+
+**No ejecutes `scripts.prepare_production_db` si la base ya existe.** El error
+`El DSN administrativo debe especificar el usuario DBA` ocurre antes de abrir
+una conexión, por lo que esa ejecución no creó la base ni roles. El asistente
+de aprovisionamiento solo sirve para base y roles nuevos.
+
+Si ya existe la base y el rol DDL (por ejemplo, `hub_user`) y solo falta el
+rol de la API:
+
+1. Conéctate con `psql` como DBA o administrador PostgreSQL que pueda crear
+   roles. Usa parámetros de conexión, no una contraseña escrita en la línea
+   de comandos; `psql` la pedirá de forma interactiva:
+
+   ```bash
+   psql "host=<DB_HOST> port=5432 dbname=postgres user=<DBA_USER> sslmode=verify-full"
+   ```
+
+   Sustituye `verify-full` por `require` solo si el servidor no dispone de un
+   certificado verificable y tu política permite cifrado sin validar el nombre
+   del servidor.
+
+2. Crea el rol runtime sin permisos administrativos y establece su contraseña
+   con el prompt seguro de `psql`:
+
+   ```sql
+   CREATE ROLE hub_runtime LOGIN;
+   \password hub_runtime
+   ```
+
+   `\password` solicita y confirma la contraseña sin incluirla en el SQL ni en
+   el historial. Si el rol ya existe, no repitas `CREATE ROLE`: un DBA puede
+   ejecutar `ALTER ROLE hub_runtime LOGIN;` y después `\password hub_runtime`.
+   Usa una contraseña robusta de al menos 12 caracteres y guárdala en el
+   gestor de secretos del servidor.
+
+3. Conéctate a la base existente como su rol DDL/propietario (ejemplo
+   `hub_user`). `psql` solicitará la contraseña si no está configurada en un
+   mecanismo seguro:
+
+   ```bash
+   psql "host=<DB_HOST> port=5432 dbname=<DB_NAME> user=<DDL_USER> sslmode=verify-full"
+   ```
+
+   Comprueba que la base y el usuario son los esperados:
+
+   ```sql
+   SELECT current_database(), current_user;
+   SELECT to_regclass('public.hub_schema_migrations');
+   ```
+
+   Si el ledger no existe, confirma que la base está vacía antes de aplicar las
+   migraciones. Si ya hay tablas de la aplicación sin ledger, o una migración
+   parcialmente aplicada, detente: no ejecutes el asistente ni edites el
+   ledger a mano; primero requiere inspección/backup del esquema existente.
+
+4. Antes de aplicar migraciones, permite solo acceso de conexión/esquema y
+   configura privilegios predeterminados **como el rol DDL que será dueño de
+   los objetos creados**:
+
+   ```sql
+   GRANT CONNECT ON DATABASE <DB_NAME> TO hub_runtime;
+   GRANT USAGE ON SCHEMA public TO hub_runtime;
+   REVOKE CREATE ON SCHEMA public FROM hub_runtime;
+   ALTER DEFAULT PRIVILEGES IN SCHEMA public
+       GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO hub_runtime;
+   ALTER DEFAULT PRIVILEGES IN SCHEMA public
+       GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO hub_runtime;
+   ```
+
+   Sustituye `<DB_NAME>` por el identificador real, sin los signos `< >`.
+   `GRANT CONNECT` puede requerir que lo ejecute el propietario de la base o
+   un DBA. El rol runtime no debe ser superuser, propietario ni miembro del rol
+   DDL.
+
+5. Aplica migraciones con el usuario DDL y su DSN async. En Ubuntu, puedes
+   introducir la variable sin mostrarla ni guardarla en el historial:
+
+   ```bash
+   read -rsp "MIGRATION_DB_DSN: " MIGRATION_DB_DSN
+   printf '\n'
+   export MIGRATION_DB_DSN
+   python -m API.core.postgres_migrations apply
+   result=$?
+   unset MIGRATION_DB_DSN
+   test "$result" -eq 0
+   ```
+
+   El DSN tiene formato
+   `postgresql+asyncpg://<DDL_USER>:<URL_ENCODED_PASSWORD>@<DB_HOST>:5432/<DB_NAME>?ssl=require`.
+   Codifica como URL los caracteres reservados de usuario/contraseña. No
+   incluyas la contraseña directamente en comandos ni en archivos del checkout.
+
+6. Ya aplicadas las migraciones, concede DML sobre los objetos actuales al rol
+   runtime (como propietario de esos objetos o DBA):
+
+   ```sql
+   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO hub_runtime;
+   GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO hub_runtime;
+   ```
+
+   Configura `DB_DSN` del servicio con el usuario runtime y verifica que
+   `MIGRATION_DB_DSN` no esté en el entorno de systemd. Reinicia la API y
+   comprueba `/ready`, enqueue/consulta de estado y que el rol runtime no puede
+   crear tablas (`CREATE TABLE` debe ser rechazado).
+
+Si la base existente ya contiene trabajos o datos, haz y verifica un backup
+antes de cambiar grants o esquema. La discrepancia histórica del checksum
+detectada en `hub_test` no debe “arreglarse” editando `001`; si la base objetivo
+ya tiene migraciones registradas, detente y reconcilia el historial con el
+administrador antes de continuar.
+
 ## Vista general y relaciones
 
 ```text
