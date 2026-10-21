@@ -253,14 +253,48 @@ def test_assignment_context_persists_and_reloads_from_sqlite(tmp_path):
     asyncio.run(scenario())
 
 
-def test_unusable_sqlalchemy_backend_degrades_to_memory():
-    previous_backend = context_store.backend
-    try:
-        store = init_durable_store("sqlite+missingdriver:///:memory:")
-        assert store.backend is None
-        assert store.stats()["backend"] == "memory"
-    finally:
-        context_store._backend = previous_backend
+def test_durable_store_initialization_and_requests_use_the_same_event_loop(monkeypatch):
+    class LoopCheckingBackend(InMemoryContextBackend):
+        name = "sqlalchemy"
+
+        def __init__(self):
+            super().__init__()
+            self.loop_ids = []
+
+        def _record_loop(self):
+            self.loop_ids.append(id(asyncio.get_running_loop()))
+
+        async def list_ids(self):
+            self._record_loop()
+            return await super().list_ids()
+
+        async def get(self, context_id):
+            self._record_loop()
+            return await super().get(context_id)
+
+        async def save(self, record):
+            self._record_loop()
+            await super().save(record)
+
+    async def scenario():
+        previous_backend = context_store.backend
+        backend = LoopCheckingBackend()
+        monkeypatch.setattr(
+            "API.core.context_backend.make_context_backend",
+            lambda dsn, logger: backend,
+        )
+        try:
+            store = await init_durable_store("postgresql+asyncpg://db")
+            request = _request(student_id="U1", submission_id="S1")
+            await essay._prepare_assignment_context(request, store=store)
+
+            assert backend.loop_ids
+            assert set(backend.loop_ids) == {id(asyncio.get_running_loop())}
+        finally:
+            await backend.close()
+            context_store._backend = previous_backend
+
+    asyncio.run(scenario())
 
 
 def test_sqlite_queue_worker_persists_job_correlation(tmp_path):

@@ -449,26 +449,6 @@ def _safe_backend_schedule(coro) -> None:
             pass
 
 
-def _run_async_sync(coro, timeout: float = 5.0) -> Any:
-    """Ejecuta un coroutine y devuelve su resultado (para rutas de inicialización)."""
-    import asyncio
-
-    if asyncio.iscoroutine(coro):
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop is not None and loop.is_running():
-            import concurrent.futures
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                return pool.submit(
-                    asyncio.run, coro
-                ).result(timeout=timeout)
-        return asyncio.run(coro)
-    return coro
-
-
 class ContextStore:
     """
     Almacén de contextos institucionales con TTL automático.
@@ -642,7 +622,7 @@ class ContextStore:
 context_store = ContextStore()
 
 
-def init_durable_store(dsn: str = "", logger_override=None) -> "ContextStore":
+async def init_durable_store(dsn: str = "", logger_override=None) -> "ContextStore":
     """
     Conecta el ContextStore singleton al backend durable (SQLite/PostgreSQL/memoria)
     y restaura los contextos no expirados.
@@ -667,11 +647,11 @@ def init_durable_store(dsn: str = "", logger_override=None) -> "ContextStore":
         try:
             # Force connection/schema errors to surface during startup rather
             # than leaving a backend selected that cannot persist contexts.
-            _run_async_sync(backend.list_ids())
-            _run_async_sync(context_store.load_from_backend())
+            await backend.list_ids()
+            await context_store.load_from_backend()
         except Exception as exc:
             logger.warning("ContextStore: backend durable no disponible: %s", exc)
-            _run_async_sync(backend.close())
+            await backend.close()
             context_store._backend = None
     else:
         logger.info("ContextStore: sin backend durable (memoria transitoria).")

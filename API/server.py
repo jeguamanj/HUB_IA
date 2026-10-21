@@ -168,7 +168,7 @@ async def lifespan(app: FastAPI):
 
     # Persistencia durable del ContextStore (SQLite/Postgres/memoria según DB_DSN)
     try:
-        store = init_durable_store(settings.db_dsn)
+        store = await init_durable_store(settings.db_dsn)
         logger.info("ContextStore durable: backend=%s", getattr(store.backend, "name", "memoria"))
     except Exception as exc:  # nunca impedir el arranque por persistencia
         logger.warning("No se pudo inicializar la persistencia del contexto: %s", exc)
